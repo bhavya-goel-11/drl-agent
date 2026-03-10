@@ -23,52 +23,39 @@ The repository is modularly structured, mirroring professional algorithmic-tradi
 
 ---
 
-## 🛠️ Prerequisites & Installation
+## 🛠️ Prerequisites & Docker Deployment
 
 ### 1. Requirements
 
 Before running the pipeline, ensure you have the following installed:
-- **Python 3.12+** (or compatible 3.x version)
-- **Docker & Docker Compose** (for hosting TimescaleDB locally)
+- **Docker & Docker Compose** (The entire pipeline, including the TimescaleDB database and the Python trading application, runs in Docker for maximum reproducibility).
 
-### 2. Set Up Database Services
+### 2. Build and Start the Docker Stack
 
-The project uses TimescaleDB via Docker for high-performance time-series data storage.
+The project uses Docker Compose to orchestrate both the TimescaleDB database and the algorithmic trading application container.
 
-```bash
-# Start TimescaleDB in detached mode
-docker-compose up -d timescaledb
-```
-
-Wait a few seconds for the database to fully initialize and pass its health check.
-
-### 3. Install Python Dependencies
-
-It is highly recommended to use a virtual environment (`venv`).
+Open your terminal and build/start the whole stack in detached mode:
 
 ```bash
-# Create a virtual environment
-python3 -m venv venv
-
-# Activate the virtual environment
-source venv/bin/activate  # On Windows use: venv\Scripts\activate
-
-# Install the dependencies
-pip install --upgrade pip
-pip install -r requirements.txt
+# Build the application image and start both services (DB + App)
+docker compose up -d --build
 ```
+
+Wait a few seconds for the database to fully initialize and for the `algo-app` container to be up and running. 
 
 ---
 
 ## 🚀 Running the Full Pipeline
 
-Follow these steps in chronological order to fetch data, train the agent, and evaluate robust out-of-sample results.
+Follow these steps in chronological order to fetch data, train the agent, and evaluate robust out-of-sample results using Docker. 
+
+All commands are executed inside the live `algo-app` container.
 
 ### Step 1: Ingest Data into TimescaleDB
 Run the data loader to fetch SPY ticker data and populate your local database. By default, it downloads data from 2020 to 2026.
 
 ```bash
-python -m data_pipeline.loader
+docker exec -it algo-app python -m data_pipeline.loader
 ```
 *Expected Output: "Saved X records for SPY to DB."*
 
@@ -76,7 +63,7 @@ python -m data_pipeline.loader
 Launch the Deep Reinforcement Learning pipeline. This script pulls the saved data, engineers technical indicators securely, splits the dataset into a strictly pre-2025 chunk, and trains the Deep Q-Network.
 
 ```bash
-python -m drl_models.train
+docker exec -it algo-app python -m drl_models.train
 ```
 *Expected Output: Training logs showing episode progress, epsilon decay, and total reward/profit. High-water mark models will automatically save to the `drl_models/` directory.*
 
@@ -84,7 +71,7 @@ python -m drl_models.train
 Evaluate the locked, trained neural network weights (`drl_models/best_dqn_trader.pth`) against unseen (out-of-sample) data. 
 
 ```bash
-python -m backtesting.evaluate
+docker exec -it algo-app python -m backtesting.evaluate
 ```
 *Expected Output: Simulation logs of trades culminating in a performance summary featuring Total Profit, Benchmark Comparisons, Sharpe Ratio, and Max Drawdown.*
 
@@ -92,19 +79,5 @@ python -m backtesting.evaluate
 Starts the scaffolding for the real-time Order Management System and mock broker signals listening for DRL activations.
 
 ```bash
-python -m execution_engine.main
-```
-
----
-
-## ⚙️ Docker Deployment (Optional)
-
-We also provide a full `Dockerfile` capable of building a containerized instance of the DRL app.
-
-```bash
-# Build the application image
-docker-compose build algo-app
-
-# Run the complete stack (DB + Application)
-docker-compose up algo-app
+docker exec -it algo-app python -m execution_engine.main
 ```
