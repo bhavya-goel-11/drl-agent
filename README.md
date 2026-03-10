@@ -75,7 +75,7 @@ docker exec -it algo-app python -m backtesting.evaluate
 ```
 *Expected Output: Simulation logs of trades culminating in a performance summary featuring Total Profit, Benchmark Comparisons, Sharpe Ratio, and Max Drawdown.*
 
-### Step 4: Live Execution Engine (Scaffold)
+### Step 4: Live Execution Engine (Scaffold, To Be Implemented for Live Trading)
 Starts the scaffolding for the real-time Order Management System and mock broker signals listening for DRL activations.
 
 ```bash
