@@ -1,0 +1,22 @@
+# Base Data Science
+numpy
+pandas
+scipy
+
+# Machine Learning & Deep Learning
+torch
+scikit-learn
+gymnasium
+
+# Financial Data & Time Series
+yfinance
+pandas-ta
+
+# Database
+SQLAlchemy
+psycopg2-binary
+
+# Utilities
+python-dotenv
+loguru
+pytest
