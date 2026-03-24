@@ -15,14 +15,15 @@ def main():
     
     db = SessionLocal()
     try:
-        logger.info("Fetching SPY historical data from PostgreSQL...")
-        records = db.query(HistoricalData).filter(HistoricalData.symbol == "SPY").order_by(HistoricalData.date.asc()).all()
+        logger.info("Fetching all available tickers from PostgreSQL (Training Firewall: Pre-2023)...")
+        records = db.query(HistoricalData).filter(HistoricalData.date < "2023-01-01").order_by(HistoricalData.date.asc()).all()
         
         if not records:
             logger.error("No data found in database! Make sure 'loader.py' was run first.")
             return
             
         data = [{
+            'symbol': r.symbol,
             'date': r.date,
             'open': r.open,
             'high': r.high,
@@ -46,18 +47,19 @@ def main():
     # 2. Add algorithmic features (indicators) & drop NaNs
     engineer = FeatureEngineer()
     engineered_df = engineer.add_technical_indicators(df)
-    engineered_df.dropna(inplace=True)
     logger.info(f"Engineered DataFrame Shape (after dropping NaNs): {engineered_df.shape}")
     
-    # 3. THE FIREWALL: Chronological Train/Test Split
-    train_cutoff = "2025-01-01"
-    train_df = engineered_df[engineered_df.index < train_cutoff].copy()
-    logger.info(f"Training Split Created: {len(train_df)} rows (Ends before {train_cutoff})")
+    # 3. Group the data by ticker into a dictionary
+    multi_ticker_data = {}
+    for ticker, group in engineered_df.groupby('symbol'):
+        multi_ticker_data[ticker] = group.copy()
+        
+    logger.info(f"Grouped into {len(multi_ticker_data)} separate ticker dataframes for training.")
     
-    # Init Env - Strictly passing the TRAINING data and explicit constraints
-    env = TradingEnv(train_df, initial_balance=10000, commission=0.001)
+    # Init Env - Passing the MULTI-TICKER data structure
+    env = TradingEnv(multi_ticker_data, initial_balance=10000)
     state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.n    
+    action_dim = env.action_space.n 
     
     # --- Hyperparameter Configuration ---
     lr = 1e-4             # Learning Rate
@@ -137,10 +139,10 @@ def main():
         if total_reward > best_reward and episode > 10: # Wait a few episodes before saving "bests"
             logger.info(f"New high-water mark! Reward improved from {best_reward:.3f} to {total_reward:.3f}. Saving model...")
             best_reward = total_reward
-            trainer.save_checkpoint("drl_models/best_dqn_trader.pth")
+            trainer.save_checkpoint("drl_models/best_universal_dqn_trader.pth")
             
     # 6. Checkpoint the final trained weights
-    trainer.save_checkpoint("drl_models/final_dqn_trader.pth")
+    trainer.save_checkpoint("drl_models/universal_dqn_trader.pth")
     logger.info("Training simulation completed. Final model weights secured for backtesting.")
 
 if __name__ == "__main__":

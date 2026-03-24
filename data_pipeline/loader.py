@@ -64,11 +64,22 @@ if __name__ == "__main__":
     import logging
     logging.basicConfig(level=logging.INFO)
     
-    target_tickers = ["SPY"] 
-    start = "2020-01-01"
+    target_tickers = [
+        'TECHM.NS', 'JSWSTEEL.NS', 'TATASTEEL.NS', 'INFY.NS', 'TRENT.NS', 
+        'BAJAJ-AUTO.NS', 'HCLTECH.NS', 'RELIANCE.NS', 'TITAN.NS', 'EICHERMOT.NS', 
+        'NTPC.NS', 'TCS.NS', 'DRREDDY.NS', 'CIPLA.NS', 'SUNPHARMA.NS', 
+        'WIPRO.NS', 'NESTLEIND.NS', 'APOLLOHOSP.NS', 'ULTRACEMCO.NS', 'BHARTIARTL.NS', 
+        'M&M.NS', 'SBIN.NS', 'ADANIPORTS.NS', 'ASIANPAINT.NS', 'HINDUNILVR.NS', 
+        'GRASIM.NS', 'POWERGRID.NS', 'ITC.NS', 'TATACONSUM.NS', 'BAJAJFINSV.NS', 
+        'MARUTI.NS', 'LT.NS', 'ICICIBANK.NS', 'AXISBANK.NS', 'BAJFINANCE.NS', 
+        'KOTAKBANK.NS', 'ADANIENT.NS', 'BEL.NS', 'ONGC.NS', 'SHRIRAMFIN.NS', 
+        'HDFCBANK.NS', 'HINDALCO.NS', 'BRITANNIA.NS', 'INDUSINDBK.NS', 
+        'HEROMOTOCO.NS', 'BPCL.NS'
+    ]
+    start = "2008-01-01"
     end = "2026-01-01"
     
-    logging.info(f"Initializing DataLoader for {target_tickers}...")
+    logging.info(f"Initializing DataLoader for {len(target_tickers)} tickers...")
     
     try:
         loader = DataLoader(tickers=target_tickers, start_date=start, end_date=end)
@@ -76,18 +87,20 @@ if __name__ == "__main__":
         # 1. Fetch the data (which returns a dictionary of DataFrames)
         data_dict = loader.fetch_historical_data() 
         
-        # 2. Check if the dictionary actually contains our ticker
-        if data_dict and "SPY" in data_dict:
-            df = data_dict["SPY"]
-            logging.info(f"Success: Extracted {len(df)} rows for SPY from the dictionary.")
-            
-            # Print the first few rows to verify the columns (Open, High, Low, Close, Volume)
-            print(df.head())
-            
-            # Next, we will uncomment the database commit method
-            loader.save_to_db(df, "SPY") 
+        # 2. Loop through the tickers and save to DB
+        if data_dict:
+            for ticker in target_tickers:
+                if ticker in data_dict:
+                    df = data_dict[ticker]
+                    logging.info(f"Success: Extracted {len(df)} rows for {ticker} from the dictionary.")
+                    print(f"--- {ticker} Data Sample ---")
+                    print(df.head())
+                    
+                    loader.save_to_db(df, ticker) 
+                else:
+                    logging.error(f"Failed: '{ticker}' key is missing in data dictionary.")
         else:
-            logging.error("Failed: Dictionary is empty or 'SPY' key is missing.")
+            logging.error("Failed: No data fetched at all.")
             
     except Exception as e:
         logging.error(f"Pipeline crashed: {e}")

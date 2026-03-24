@@ -1,10 +1,68 @@
+# Virtual Environments
 venv/
+env/
+.venv/
+.conda/
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment & Secrets
 .env
+
+# Databases
 *.db
 *.sqlite3
+
+# Model Checkpoints & Weights
 *.pth
+*.pt
+*.h5
+*.onnx
+
+# Data Files
+*.csv
+*.tsv
+*.npy
+*.npz
+
+# Generated Reports & Outputs
+reports/
+
+# Logs
+logs/
+*.log
+runs/
+wandb/
+mlruns/
+tb_logs/
+
+# Notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# System & IDE Files
 .DS_Store
 .idea/
 .vscode/
+*.swp
+*.swo
+
+# Build Artifacts
+build/
+dist/
+tmp/
+temp/
+
+# Compressed Files
+*.zip
+*.tar
+*.gz
+*.tgz
+*.rar

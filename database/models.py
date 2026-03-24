@@ -6,9 +6,8 @@ Base = declarative_base()
 class HistoricalData(Base):
     __tablename__ = "historical_data"
 
-    id = Column(Integer, primary_key=True, index=True)
-    symbol = Column(String, index=True)
-    date = Column(DateTime(timezone=True), index=True)
+    symbol = Column(String, primary_key=True, index=True)
+    date = Column(DateTime(timezone=True), primary_key=True, index=True)
     open = Column(Float)
     high = Column(Float)
     low = Column(Float)

@@ -3,21 +3,43 @@ import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
 from loguru import logger
+import random
 
 class TradingEnv(gym.Env):
     """An institutional-grade stock trading environment for OpenAI gym"""
     metadata = {'render.modes': ['human']}
 
-    def __init__(self, df: pd.DataFrame, initial_balance=10000, commission=0.001):
+    def __init__(self, data, initial_balance=10000, commission=0.002):
         super(TradingEnv, self).__init__()
         
-        self.df = df.reset_index(drop=True)
-        self.initial_balance = initial_balance
-        self.commission = commission # 0.1% transaction fee to simulate slippage
+        # Handle different input data formats (dictionary, groupby object, or plain DataFrame)
+        if isinstance(data, dict):
+            self.tickers = list(data.keys())
+            self.data_dict = {ticker: df.copy().reset_index(drop=True) for ticker, df in data.items()}
+        elif hasattr(data, 'groups'): # Covers DataFrameGroupBy
+            self.tickers = list(data.groups.keys())
+            self.data_dict = {ticker: group.copy().reset_index(drop=True) for ticker, group in data}
+        elif isinstance(data, pd.DataFrame):
+            if 'symbol' in data.columns:
+                grouped = data.groupby('symbol')
+                self.tickers = list(grouped.groups.keys())
+                self.data_dict = {ticker: group.copy().reset_index(drop=True) for ticker, group in grouped}
+            else:
+                self.tickers = ['DEFAULT']
+                self.data_dict = {'DEFAULT': data.copy().reset_index(drop=True)}
+        else:
+            raise ValueError("Unsupported data format. Please provide a dict or grouped DataFrame.")
+            
+        # Ensure pure numeric state space to match required feature constraints without data format crashing
+        for ticker, df in self.data_dict.items():
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            self.data_dict[ticker] = df[numeric_cols]
         
-        # Calculate statistics for Z-score normalization
-        self.feature_means = self.df.mean()
-        self.feature_stds = self.df.std().replace(0, 1e-8)
+        self.initial_balance = initial_balance
+        self.commission = commission
+        
+        self.active_ticker = random.choice(self.tickers)
+        self.df = self.data_dict[self.active_ticker]
         
         # Action space: 0 = Hold, 1 = Buy, 2 = Sell
         self.action_space = spaces.Discrete(3)
@@ -27,10 +49,15 @@ class TradingEnv(gym.Env):
             low=-np.inf, high=np.inf, shape=(num_features + 3,), dtype=np.float32
         )
         
-        logger.info(f"Initialized TradingEnv with shape {self.observation_space.shape}")
+        logger.info(f"Initialized TradingEnv with {len(self.tickers)} tickers. Target feature shape {self.observation_space.shape}")
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
+        
+        # Episodic Ticker Randomization
+        self.active_ticker = random.choice(self.tickers)
+        self.df = self.data_dict[self.active_ticker]
+        
         self.balance = self.initial_balance
         self.net_worth = self.initial_balance
         self.shares_held = 0
