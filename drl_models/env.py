@@ -20,8 +20,9 @@ class TradingEnv(gym.Env):
             self.tickers = list(data.groups.keys())
             self.data_dict = {ticker: group.copy().reset_index(drop=True) for ticker, group in data}
         elif isinstance(data, pd.DataFrame):
-            if 'symbol' in data.columns:
-                grouped = data.groupby('symbol')
+            ticker_col = 'ticker' if 'ticker' in data.columns else 'symbol' if 'symbol' in data.columns else None
+            if ticker_col:
+                grouped = data.groupby(ticker_col)
                 self.tickers = list(grouped.groups.keys())
                 self.data_dict = {ticker: group.copy().reset_index(drop=True) for ticker, group in grouped}
             else:

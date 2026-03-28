@@ -16,24 +16,9 @@ htmlcov/
 # Environment & Secrets
 .env
 
-# Databases
+# Databases (legacy)
 *.db
 *.sqlite3
-
-# Model Checkpoints & Weights
-*.pth
-*.pt
-*.h5
-*.onnx
-
-# Data Files
-*.csv
-*.tsv
-*.npy
-*.npz
-
-# Generated Reports & Outputs
-reports/
 
 # Logs
 logs/
@@ -43,8 +28,7 @@ wandb/
 mlruns/
 tb_logs/
 
-# Notebooks
-*.ipynb
+# Notebook Checkpoints (but allow .ipynb files themselves)
 .ipynb_checkpoints/
 
 # System & IDE Files

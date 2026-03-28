@@ -1,10 +1,16 @@
 import os
+from pathlib import Path
+
 import pandas as pd
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 import seaborn as sns
 from loguru import logger
+
+# Absolute path to reports/ so it works regardless of CWD (e.g. Colab)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+REPORTS_DIR = PROJECT_ROOT / "reports"
 
 class BacktestEngine:
     """
@@ -37,7 +43,7 @@ class BacktestEngine:
         self.trading_dates = all_dates.sort_values().unique()
         
         # Ensure reporting directory exists
-        os.makedirs("reports", exist_ok=True)
+        os.makedirs(str(REPORTS_DIR), exist_ok=True)
 
     def _build_state(self, ticker: str, current_date: pd.Timestamp, total_net_worth: float, current_price: float) -> np.ndarray:
         df = self.data_dict[ticker]
@@ -142,7 +148,7 @@ class BacktestEngine:
         logger.info("Compiling final analytics and generating visual reports...")
         
         # 1. Export Trade Ledger
-        pd.DataFrame(self.trade_ledger).to_csv("reports/detailed_trade_ledger.csv", index=False)
+        pd.DataFrame(self.trade_ledger).to_csv(str(REPORTS_DIR / "detailed_trade_ledger.csv"), index=False)
         
         results = []
         agg_ai_equity = np.zeros(len(self.dates))
@@ -183,7 +189,7 @@ class BacktestEngine:
 
         # 2. Console Summary & CSV Metrics
         res_df = pd.DataFrame(results).sort_values(by="Alpha (%)", ascending=False)
-        res_df.to_csv("reports/ticker_comparative_metrics.csv", index=False)
+        res_df.to_csv(str(REPORTS_DIR / "ticker_comparative_metrics.csv"), index=False)
         
         logger.info("\n" + "="*100 + "\nINDIVIDUAL TICKER PERFORMANCE: AI vs BENCHMARK\n" + "="*100)
         logger.info(f"\n{res_df.to_string(index=False)}")
@@ -216,7 +222,7 @@ class BacktestEngine:
         plt.ylabel('Total Net Worth (₹)', fontsize=12)
         plt.legend()
         plt.tight_layout()
-        plt.savefig("reports/equity_curve.png", dpi=300)
+        plt.savefig(str(REPORTS_DIR / "equity_curve.png"), dpi=300)
         plt.close()
         
         # Plot 2: Alpha Distribution Bar Chart
@@ -226,7 +232,7 @@ class BacktestEngine:
         plt.title('Alpha Generated per Stock', fontsize=14, fontweight='bold')
         plt.xticks(rotation=90, fontsize=8)
         plt.tight_layout()
-        plt.savefig("reports/alpha_distribution.png", dpi=300)
+        plt.savefig(str(REPORTS_DIR / "alpha_distribution.png"), dpi=300)
         plt.close()
 
         logger.info("Reports saved to the 'reports/' directory.")

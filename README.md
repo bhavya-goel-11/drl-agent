@@ -2,82 +2,109 @@
 
 ## Project Description
 
-This repository hosts a robust, end-to-end algorithmic trading system powered by Deep Reinforcement Learning (DRL). Utilizing a PyTorch-based Deep Q-Network (DQN) architecture, the agent learns optimal trading strategies (Buy, Sell, Hold) based on historical financial data and engineered technical indicators. 
+This repository hosts a robust, end-to-end algorithmic trading system powered by Deep Reinforcement Learning (DRL). Utilizing a PyTorch-based Deep Q-Network (DQN) architecture, the agent learns optimal trading strategies (Buy, Sell, Hold) based on historical financial data and 31 engineered technical indicators across the full Nifty-50 universe.
 
-The pipeline includes an automated chronologically-ordered data fetcher connected to a high-performance **PostgreSQL + TimescaleDB** backend, a fully functional reinforcement learning training loop with an **Experience Replay Buffer** and **Target Network Syncing**, and an event-driven out-of-sample backtesting engine to evaluate the learned strategies with realistic portfolio metrics (Sharpe Ratio, Max Drawdown).
+The pipeline is **100% Git-Native** — all code execution happens on Google Colab with free GPU, while all state (processed data, model weights, backtest reports) is automatically versioned and pushed back to this GitHub repository via Git LFS.
 
 ## 🏗️ Architecture & Project Structure
 
-The repository is modularly structured, mirroring professional algorithmic-trading platforms:
-
-- **`data_pipeline/`**: Handles the ETL process. Fetches historical market data via `yfinance` (`loader.py`), cleans it, and persists it into TimescaleDB. Adds actionable technical indicators (`features.py`) using `pandas-ta`.
-- **`database/`**: Contains database connections and SQLAlchemy ORM models (`connection.py`, `models.py`) connecting to the locally hosted TimescaleDB container.
-- **`drl_models/`**: The core AI logic.
-  - `env.py`: An OpenAI Gym styled environment representing the stock market, taking in states and yielding rewards.
-  - `agent.py`: Defines the PyTorch Neural Network, DQN Target Network, and Replay Buffer.
-  - `train.py`: Initializes the environment and executes the reinforcement learning training suite with an epsilon-greedy algorithm.
-- **`backtesting/`**: 
-  - `engine.py`: A chronological, event-driven backtesting engine to simulate an out-of-sample live market block.
-  - `evaluate.py`: The entry point script that connects the trained high-water mark model (`.pth`) to the testing block.
-- **`execution_engine/`**: (Scaffolded) Manages signal generation, OMS (Order Management System), and Mock Broker interactions.
+```
+drl-agent/
+├── colab_pipeline.ipynb     ← Master Colab notebook (run this)
+├── data/                    ← Processed .parquet data (Git LFS)
+├── models/                  ← Trained .pth weights (Git LFS)
+├── reports/                 ← Backtest PNGs & CSVs (Git LFS)
+├── data_pipeline/
+│   ├── loader.py            ← yfinance fetch → feature eng → parquet
+│   └── features.py          ← 31-feature engineering (pandas-ta)
+├── drl_models/
+│   ├── agent.py             ← DQN + Target Network + Replay Buffer
+│   ├── env.py               ← OpenAI Gym trading environment
+│   └── train.py             ← Training loop with periodic git-sync
+├── backtesting/
+│   ├── engine.py            ← Event-driven multi-asset backtest
+│   ├── evaluate.py          ← OOS evaluation entry point
+│   └── metrics.py           ← Sharpe, Max Drawdown calculators
+├── execution_engine/        ← (Scaffolded) Live trading OMS
+├── utils/
+│   └── git_sync.py          ← Git commit/push automation
+└── requirements.txt
+```
 
 ---
 
-## 🛠️ Prerequisites & Docker Deployment
+## 🛠️ Prerequisites
 
-### 1. Requirements
-
-Before running the pipeline, ensure you have the following installed:
-- **Docker & Docker Compose** (The entire pipeline, including the TimescaleDB database and the Python trading application, runs in Docker for maximum reproducibility).
-
-### 2. Build and Start the Docker Stack
-
-The project uses Docker Compose to orchestrate both the TimescaleDB database and the algorithmic trading application container.
-
-Open your terminal and build/start the whole stack in detached mode:
-
-```bash
-# Build the application image and start both services (DB + App)
-docker compose up -d --build
-```
-
-Wait a few seconds for the database to fully initialize and for the `algo-app` container to be up and running. 
+1. A **Google account** with access to [Google Colab](https://colab.research.google.com)
+2. A **GitHub Personal Access Token (PAT)** with `repo` scope
+   - Create at: [github.com/settings/tokens](https://github.com/settings/tokens) → Classic → Scope: `repo`
+3. **Git LFS** enabled on this repository (one-time setup):
+   ```bash
+   git lfs install
+   git lfs track "data/*.parquet" "models/*.pth" "reports/*.png"
+   git add .gitattributes && git commit -m "Enable Git LFS"
+   ```
 
 ---
 
-## 🚀 Running the Full Pipeline
+## 🚀 Running the Full Pipeline (Google Colab)
 
-Follow these steps in chronological order to fetch data, train the agent, and evaluate robust out-of-sample results using Docker. 
+### Option A: One-Click (Recommended)
 
-All commands are executed inside the live `algo-app` container.
+1. Open [`colab_pipeline.ipynb`](colab_pipeline.ipynb) in Google Colab
+2. Set runtime to **GPU** (Runtime → Change runtime type → T4 GPU)
+3. Run all cells sequentially
+4. Enter your GitHub PAT when prompted
 
-### Step 1: Ingest Data into TimescaleDB
-Run the data loader to fetch SPY ticker data and populate your local database. By default, it downloads data from 2020 to 2026.
+The notebook will automatically:
+- Clone this repo
+- Install all dependencies in a venv
+- Execute the 3-stage pipeline
+- Push all results back to GitHub
 
-```bash
-docker exec -it algo-app python -m data_pipeline.loader
-```
-*Expected Output: "Saved X records for SPY to DB."*
-
-### Step 2: Train the DRL Agent
-Launch the Deep Reinforcement Learning pipeline. This script pulls the saved data, engineers technical indicators securely, splits the dataset into a strictly pre-2025 chunk, and trains the Deep Q-Network.
-
-```bash
-docker exec -it algo-app python -m drl_models.train
-```
-*Expected Output: Training logs showing episode progress, epsilon decay, and total reward/profit. High-water mark models will automatically save to the `drl_models/` directory.*
-
-### Step 3: Out-of-Sample Backtesting
-Evaluate the locked, trained neural network weights (`drl_models/best_dqn_trader.pth`) against unseen (out-of-sample) data. 
+### Option B: Manual (Local or Any Environment)
 
 ```bash
-docker exec -it algo-app python -m backtesting.evaluate
-```
-*Expected Output: Simulation logs of trades culminating in a performance summary featuring Total Profit, Benchmark Comparisons, Sharpe Ratio, and Max Drawdown.*
+# Clone and setup
+git clone https://github.com/bhavya-goel-11/drl-agent.git
+cd drl-agent
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
 
-### Step 4: Live Execution Engine (Scaffold, To Be Implemented for Live Trading)
-Starts the scaffolding for the real-time Order Management System and mock broker signals listening for DRL activations.
+# Stage 1: Fetch data & engineer features
+python3 -m data_pipeline.loader
 
-```bash
-docker exec -it algo-app python -m execution_engine.main
+# Stage 2: Train the DRL agent
+python3 -m drl_models.train
+
+# Stage 3: Out-of-sample backtest
+python3 -m backtesting.evaluate
 ```
+
+---
+
+## 📊 Pipeline Stages
+
+### Stage 1: Data Pipeline
+Downloads OHLCV data for 46 Nifty-50 stocks + `^NSEI` benchmark (2008-2026) via `yfinance`, applies 31 technical indicators (SMA, RSI, MACD, Bollinger Bands, ATR, ADX, ROC, CMF, VWAP, RS Momentum), and saves the result as a compressed Parquet file.
+
+### Stage 2: DRL Training
+Trains a Double DQN with Experience Replay on pre-2023 data across all tickers simultaneously. The agent learns to Buy/Sell/Hold based on the 31-feature state space. Model weights are checkpointed every 50 episodes and pushed to GitHub.
+
+### Stage 3: Out-of-Sample Backtesting
+Evaluates the frozen model on unseen post-2023 data with independent ₹1L accounts per stock. Generates equity curves, alpha distribution charts, Sharpe Ratios, and Max Drawdown metrics.
+
+---
+
+## 📁 Output Artifacts
+
+| Artifact | Path | Description |
+|----------|------|-------------|
+| Processed Data | `data/processed_data.parquet` | 31-feature engineered dataset |
+| Best Model | `models/best_model.pth` | Highest-reward model weights |
+| Final Model | `models/final_model.pth` | End-of-training weights |
+| Equity Curve | `reports/equity_curve.png` | AI vs Benchmark portfolio |
+| Alpha Chart | `reports/alpha_distribution.png` | Per-stock alpha bars |
+| Metrics CSV | `reports/ticker_comparative_metrics.csv` | Full performance table |
+| Trade Ledger | `reports/detailed_trade_ledger.csv` | Every trade executed |

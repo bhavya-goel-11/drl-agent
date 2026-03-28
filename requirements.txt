@@ -11,13 +11,9 @@ gymnasium
 # Financial Data & Time Series
 yfinance
 pandas-ta
-
-# Database
-SQLAlchemy
-psycopg2-binary
+pyarrow
 
 # Utilities
-python-dotenv
 loguru
 pytest
 matplotlib

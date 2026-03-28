@@ -124,42 +124,27 @@ class FeatureEngineer:
 
 if __name__ == "__main__":
     import logging
-    import pandas as pd
-    from database import SessionLocal, HistoricalData
-    
+    import yfinance as yf
+
     logging.basicConfig(level=logging.INFO)
-    logger.info("Initializing FeatureEngineer test run...")
-    
-    db = SessionLocal()
-    try:
-        # Fetch data from the database
-        ticker = "RELIANCE.NS"
-        records = db.query(HistoricalData).filter(HistoricalData.symbol == ticker).order_by(HistoricalData.date.asc()).all()
-        logger.info(f"Fetched {len(records)} {ticker} records from db.")
-        
-        if records:
-            # Convert to DataFrame
-            data = [{
-                'date': r.date,
-                'open': r.open,
-                'high': r.high,
-                'low': r.low,
-                'close': r.close,
-                'volume': r.volume,
-                'symbol': ticker
-            } for r in records]
-            
-            df = pd.DataFrame(data)
-            df.set_index('date', inplace=True)
-            
-            engineer = FeatureEngineer()
-            df_with_features = engineer.add_technical_indicators(df)
-            
-            logger.info("Sample of calculated features:")
-            print(df_with_features.head())
-            print(df_with_features.columns)
-            
-    except Exception as e:
-        logger.error(f"Failed to calculate features: {e}")
-    finally:
-        db.close()
+    logger.info("Initializing FeatureEngineer standalone test…")
+
+    ticker = "RELIANCE.NS"
+    logger.info(f"Downloading {ticker} from yfinance…")
+    df = yf.download(ticker, start="2020-01-01", end="2024-01-01", progress=False)
+
+    if df.empty:
+        logger.error(f"No data returned for {ticker}.")
+    else:
+        # Standardise columns
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+        df.columns = [c.lower() for c in df.columns]
+        df["symbol"] = ticker
+
+        engineer = FeatureEngineer()
+        df_feat = engineer.add_technical_indicators(df)
+
+        logger.info(f"Result shape: {df_feat.shape}")
+        print(df_feat.head())
+        print(df_feat.columns.tolist())
