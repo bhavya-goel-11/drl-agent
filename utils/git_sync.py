@@ -22,7 +22,7 @@ def setup_git_identity(name: str = "Colab Pipeline", email: str = "colab@pipelin
 
 
 def git_sync(paths: list, message: str, repo_dir: str = None) -> bool:
-    """Stage specific paths, commit, and push to origin main.
+    """Stage specific paths, commit, and push to origin master.
 
     Parameters
     ----------
@@ -60,7 +60,7 @@ def git_sync(paths: list, message: str, repo_dir: str = None) -> bool:
             return False
 
         # Push
-        push_result = _run_git(["push", "origin", "main"], cwd=cwd)
+        push_result = _run_git(["push", "origin", "master"], cwd=cwd)
         if push_result.returncode != 0:
             logger.warning(f"git push failed: {push_result.stderr}")
             return False
