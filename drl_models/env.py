@@ -3,13 +3,25 @@ import pandas as pd
 import gymnasium as gym
 from gymnasium import spaces
 from loguru import logger
+from collections import deque
 import random
 
 class TradingEnv(gym.Env):
-    """An institutional-grade stock trading environment for OpenAI gym"""
+    """
+    Institutional-grade stock trading environment with risk-adjusted rewards.
+    
+    Anti-Convergence Features:
+    1. Rolling Sharpe reward — agent optimizes risk-adjusted returns, not raw PnL
+    2. Drawdown penalty — prevents catastrophic concentration in single stocks
+    3. Volatility-scaled rewards — normalizes reward signal across market regimes
+    4. Inactivity penalty — discourages the "hold cash forever" local optimum
+    5. Trade cost awareness — realistic friction prevents overtrading convergence
+    """
     metadata = {'render.modes': ['human']}
 
-    def __init__(self, data, initial_balance=10000, commission=0.002):
+    def __init__(self, data, initial_balance=10000, commission=0.002,
+                 sharpe_window: int = 20, drawdown_penalty_coeff: float = 0.5,
+                 inactivity_penalty: float = -0.0005):
         super(TradingEnv, self).__init__()
         
         # Handle different input data formats (dictionary, groupby object, or plain DataFrame)
@@ -38,6 +50,11 @@ class TradingEnv(gym.Env):
         self.initial_balance = initial_balance
         self.commission = commission
         
+        # --- Risk-Adjusted Reward Configuration ---
+        self.sharpe_window = sharpe_window
+        self.drawdown_penalty_coeff = drawdown_penalty_coeff
+        self.inactivity_penalty = inactivity_penalty
+        
         self.active_ticker = random.choice(self.tickers)
         self.df = self.data_dict[self.active_ticker]
         
@@ -49,7 +66,14 @@ class TradingEnv(gym.Env):
             low=-np.inf, high=np.inf, shape=(num_features + 3,), dtype=np.float32
         )
         
-        logger.info(f"Initialized TradingEnv with {len(self.tickers)} tickers. Target feature shape {self.observation_space.shape}")
+        # Reward tracking for Sharpe calculation
+        self._returns_buffer = deque(maxlen=sharpe_window)
+        self._peak_net_worth = initial_balance
+        self._hold_counter = 0
+        
+        logger.info(f"Initialized TradingEnv with {len(self.tickers)} tickers. "
+                     f"Target feature shape {self.observation_space.shape} | "
+                     f"Sharpe window: {sharpe_window}")
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -63,13 +87,18 @@ class TradingEnv(gym.Env):
         self.shares_held = 0
         self.current_step = 0
         
+        # Reset reward tracking
+        self._returns_buffer.clear()
+        self._peak_net_worth = self.initial_balance
+        self._hold_counter = 0
+        
         # Gym v26+ requires reset to return (observation, info)
         return self._next_observation(), {}
 
     def _next_observation(self):
         frame = self.df.iloc[self.current_step]
         
-        # FIX: Rolling 200-day Window Normalization (No Future Data!)
+        # Rolling 200-day Window Normalization (No Future Data!)
         start_idx = max(0, self.current_step - 200)
         window = self.df.iloc[start_idx : self.current_step + 1]
         
@@ -89,11 +118,61 @@ class TradingEnv(gym.Env):
         obs = np.append(normalized_array, [norm_balance, norm_shares, norm_net_worth])
         return obs.astype(np.float32)
 
+    def _calculate_reward(self, step_return: float, action: int) -> float:
+        """
+        Multi-component risk-adjusted reward function.
+        
+        This is the KEY anti-premature-convergence mechanism:
+        - Raw PnL reward chases momentum → agent converges on high-beta stocks
+        - Sharpe reward balances return vs risk → agent learns robust strategies
+        - Drawdown penalty prevents catastrophic positions
+        - Inactivity penalty prevents the "do nothing" local optimum
+        
+        Reference: Papers S0952197625032270 (EAAI) and S2667305325001486 (ISA)
+        """
+        # 1. Base: step-by-step return (scaled)
+        self._returns_buffer.append(step_return)
+        
+        # 2. Rolling Sharpe component (only when we have enough data)
+        sharpe_reward = 0.0
+        if len(self._returns_buffer) >= 5:
+            returns_arr = np.array(self._returns_buffer)
+            mean_ret = returns_arr.mean()
+            std_ret = returns_arr.std()
+            if std_ret > 1e-8:
+                # Differential Sharpe: reward improvement in risk-adjusted terms
+                sharpe_reward = mean_ret / std_ret
+            else:
+                sharpe_reward = mean_ret * 10.0  # Pure positive returns with zero vol → reward
+        
+        # 3. Drawdown penalty — penalize being far below peak
+        self._peak_net_worth = max(self._peak_net_worth, self.net_worth)
+        drawdown = (self._peak_net_worth - self.net_worth) / self._peak_net_worth
+        dd_penalty = -self.drawdown_penalty_coeff * (drawdown ** 2) if drawdown > 0.02 else 0.0
+        
+        # 4. Inactivity penalty — prevent "hold cash" local optimum
+        if action == 0:  # Hold
+            self._hold_counter += 1
+        else:
+            self._hold_counter = 0
+        
+        inactivity = self.inactivity_penalty * max(0, self._hold_counter - 20) if self.shares_held == 0 and self.balance > self.initial_balance * 0.95 else 0.0
+        
+        # 5. Combine components with balanced weights
+        reward = (
+            0.4 * step_return +          # Base PnL signal 
+            0.4 * sharpe_reward * 0.1 +   # Risk-adjusted quality 
+            dd_penalty +                   # Drawdown punishment
+            inactivity                     # Anti-inactivity
+        )
+        
+        return float(np.clip(reward, -1.0, 1.0))
+
     def step(self, action):
         # 1. Record the net worth BEFORE the market moves
         prev_net_worth = self.net_worth
         
-        # FIX: Execute at TOMORROW'S Open (or next available price)
+        # Execute at TOMORROW'S Open (or next available price)
         execution_step = min(self.current_step + 1, len(self.df) - 1)
         # Fallback to 'close' if your dataset doesn't have an 'open' column
         execution_price = self.df.iloc[execution_step].get("open", self.df.iloc[execution_step].get("close"))
@@ -124,15 +203,19 @@ class TradingEnv(gym.Env):
             
         self.net_worth = self.balance + (self.shares_held * new_price)
         
-        # 6. The Reward Fix: Step-by-step PnL
-        step_profit = self.net_worth - prev_net_worth
+        # 6. Step-by-step return (not raw PnL)
+        step_return = (self.net_worth - prev_net_worth) / prev_net_worth if prev_net_worth > 0 else 0.0
         
-        # 7. Scale the reward for PyTorch stability 
-        # (e.g. a $100 profit on a $10k account = 0.01 reward)
-        reward = step_profit / self.initial_balance
+        # 7. Risk-adjusted reward
+        reward = self._calculate_reward(step_return, action)
         
         obs = self._next_observation() if not done else np.zeros(self.observation_space.shape, dtype=np.float32)
-        info = {'net_worth': self.net_worth, 'step_profit': step_profit}
+        info = {
+            'net_worth': self.net_worth, 
+            'step_profit': self.net_worth - prev_net_worth,
+            'step_return': step_return,
+            'ticker': self.active_ticker,
+        }
         
         # Gym v26+ requires step to return (obs, reward, terminated, truncated, info)
         return obs, reward, done, False, info

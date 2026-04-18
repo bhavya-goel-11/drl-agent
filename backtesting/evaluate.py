@@ -12,9 +12,13 @@ from database.models import HistoricalData
 from data_pipeline.features import FeatureEngineer
 from drl_models.agent import DRLAgent
 from backtesting.engine import BacktestEngine
+from backtesting.ml_baselines import MLBaselineTrader
 
 def main():
-    logger.info("Initializing Universal Out-of-Sample Backtest Pipeline...")
+    logger.info("=" * 80)
+    logger.info("Initializing Comprehensive Model Evaluation Pipeline")
+    logger.info("  DRL (D3QN) vs Traditional ML (GradientBoosting, RandomForest)")
+    logger.info("=" * 80)
     
     # 1. Fetch data from TimescaleDB
     db = SessionLocal()
@@ -67,29 +71,76 @@ def main():
     state_dim = num_features + 3 
     action_dim = 3  
     
-    logger.info(f"Detected {num_features} indicators. Initializing Universal Network (State Dim: {state_dim})...")
+    logger.info(f"Detected {num_features} indicators. Initializing D3QN Network (State Dim: {state_dim})...")
     agent = DRLAgent(state_dim=state_dim, action_dim=action_dim)
     
     # 5. Load the Final Weights
     model_path = "drl_models/best_universal_dqn_trader.pth"
     try:
-        agent.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+        checkpoint = torch.load(model_path, map_location=torch.device('cpu'))
+        if isinstance(checkpoint, dict) and 'policy_net' in checkpoint:
+            agent.load_state_dict(checkpoint['policy_net'])
+        else:
+            agent.load_state_dict(checkpoint)
         agent.eval() 
-        logger.info("Universal model weights loaded and locked successfully.")
+        logger.info("D3QN model weights loaded and locked successfully.")
     except Exception as e:
         logger.error(f"Failed to load weights: {e}")
         return
 
-    # 6. Execute "Sticky" Multi-Asset Allocation Backtest
+    # =========================================================================
+    # PART A: DRL Agent Backtest
+    # =========================================================================
+    logger.info("\n" + "=" * 80)
+    logger.info("PART A: DRL Agent (D3QN) Out-of-Sample Backtest")
+    logger.info("=" * 80)
+    
     engine = BacktestEngine(
         multi_ticker_data=multi_ticker_data, 
         model=agent, 
         start_date="2023-01-01", 
         per_stock_budget=100000.0,
         commission=0.002, 
-
     )
     engine.run()
+
+    # =========================================================================
+    # PART B: Traditional ML Baseline Comparison
+    # =========================================================================
+    logger.info("\n" + "=" * 80)
+    logger.info("PART B: Traditional ML Baseline Models")
+    logger.info("=" * 80)
+    
+    ml_trader = MLBaselineTrader(train_cutoff="2023-01-01")
+    ml_trader.train(multi_ticker_data)
+    
+    ml_results = []
+    for model_name in ['gradient_boosting', 'random_forest']:
+        logger.info(f"\nBacktesting {model_name.replace('_', ' ').title()}...")
+        result = ml_trader.backtest_single_model(
+            model_name=model_name,
+            multi_ticker_data=multi_ticker_data,
+            start_date="2023-01-01",
+            per_stock_budget=100000.0,
+            commission=0.002,
+        )
+        ml_results.append(result)
+        
+        logger.info(f"  {model_name}: Return={result['portfolio_return']:.2f}% | "
+                     f"Sharpe={result['portfolio_sharpe']:.2f} | "
+                     f"MaxDD={result['portfolio_max_dd']:.2f}% | "
+                     f"Trades={result['trades']}")
+    
+    # =========================================================================
+    # PART C: Comparative Report
+    # =========================================================================
+    logger.info("\n" + "=" * 80)
+    logger.info("PART C: Comparative Analysis — DRL vs Traditional ML")
+    logger.info("=" * 80)
+    
+    engine.generate_comparative_report(ml_results)
+    
+    logger.info("\n✅ Full evaluation pipeline complete. Check 'reports/' for all outputs.")
 
 if __name__ == "__main__":
     main()

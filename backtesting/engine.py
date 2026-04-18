@@ -11,6 +11,8 @@ class BacktestEngine:
     Comprehensive Quantitative Reporting Suite.
     Compares Independent AI Agent performance against a Buy & Hold Benchmark 
     across all 47 tickers with risk-adjusted metrics (Sharpe, MaxDD).
+    
+    Now includes ML baseline comparison support.
     """
     
     def __init__(self, multi_ticker_data: dict, model, start_date: str = "2023-01-01", 
@@ -35,6 +37,11 @@ class BacktestEngine:
             filtered = df[df.index >= self.start_date]
             all_dates = all_dates.union(filtered.index)
         self.trading_dates = all_dates.sort_values().unique()
+        
+        # Store aggregate equity for ML comparison
+        self.agg_ai_equity = None
+        self.agg_bench_equity = None
+        self.ai_portfolio_results = {}
         
         # Ensure reporting directory exists
         os.makedirs("reports", exist_ok=True)
@@ -138,7 +145,7 @@ class BacktestEngine:
 
         self._generate_reports()
 
-    def _generate_reports(self):
+    def _generate_reports(self, ml_results: list = None):
         logger.info("Compiling final analytics and generating visual reports...")
         
         # 1. Export Trade Ledger
@@ -180,6 +187,10 @@ class BacktestEngine:
                 "Bench_MaxDD (%)": bench_mdd,
                 "Train_Rows": self.data_density[t]
             })
+        
+        # Store for comparison
+        self.agg_ai_equity = agg_ai_equity
+        self.agg_bench_equity = agg_bench_equity
 
         # 2. Console Summary & CSV Metrics
         res_df = pd.DataFrame(results).sort_values(by="Alpha (%)", ascending=False)
@@ -192,6 +203,16 @@ class BacktestEngine:
         total_bench_ret = ((agg_bench_equity[-1] / agg_bench_equity[0]) - 1) * 100
         port_sharpe, port_mdd = self._calc_metrics(agg_ai_equity)
         bench_port_sharpe, bench_port_mdd = self._calc_metrics(agg_bench_equity)
+        
+        # Store portfolio-level results
+        self.ai_portfolio_results = {
+            'return': total_ai_ret,
+            'sharpe': port_sharpe,
+            'max_dd': port_mdd,
+            'bench_return': total_bench_ret,
+            'bench_sharpe': bench_port_sharpe,
+            'bench_max_dd': bench_port_mdd,
+        }
         
         logger.info("\n" + "="*80 + "\nMACRO PORTFOLIO SUMMARY\n" + "="*80)
         logger.info(f"Total Portfolio AI Return:   {total_ai_ret:.2f}%")
@@ -209,8 +230,8 @@ class BacktestEngine:
         sns.set_theme(style="darkgrid")
         
         # Plot 1: Cumulative Equity Curve
-        plt.figure(figsize=(12, 6))
-        plt.plot(self.dates, agg_ai_equity, label='AI Prop Fund (Total)', color='#00ff88', linewidth=2)
+        plt.figure(figsize=(14, 7))
+        plt.plot(self.dates, agg_ai_equity, label='D3QN AI Agent (Total)', color='#00ff88', linewidth=2)
         plt.plot(self.dates, agg_bench_equity, label='Buy & Hold Benchmark (Total)', color='#ff3366', linewidth=1.5, alpha=0.8)
         plt.title('Total Portfolio Equity Curve (AI vs Benchmark)', fontsize=14, fontweight='bold')
         plt.ylabel('Total Net Worth (₹)', fontsize=12)
@@ -230,3 +251,92 @@ class BacktestEngine:
         plt.close()
 
         logger.info("Reports saved to the 'reports/' directory.")
+    
+    def generate_comparative_report(self, ml_results: list):
+        """
+        Generate a comprehensive DRL vs Traditional ML comparison report.
+        Call this AFTER run() and after ML baselines have been backtested.
+        
+        Args:
+            ml_results: list of dicts from MLBaselineTrader.backtest_single_model()
+        """
+        logger.info("\n" + "=" * 100)
+        logger.info("COMPREHENSIVE MODEL COMPARISON: DRL vs TRADITIONAL ML")
+        logger.info("=" * 100)
+        
+        comparison_rows = [{
+            'Model': 'D3QN (DRL Agent)',
+            'Portfolio Return (%)': self.ai_portfolio_results.get('return', 0),
+            'Sharpe Ratio': self.ai_portfolio_results.get('sharpe', 0),
+            'Max Drawdown (%)': self.ai_portfolio_results.get('max_dd', 0),
+            'Alpha vs B&H (%)': round(
+                self.ai_portfolio_results.get('return', 0) - 
+                self.ai_portfolio_results.get('bench_return', 0), 2
+            ),
+            'Total Trades': len(self.trade_ledger),
+        }]
+        
+        for ml_res in ml_results:
+            comparison_rows.append({
+                'Model': ml_res['model_name'].replace('_', ' ').title(),
+                'Portfolio Return (%)': ml_res['portfolio_return'],
+                'Sharpe Ratio': ml_res['portfolio_sharpe'],
+                'Max Drawdown (%)': ml_res['portfolio_max_dd'],
+                'Alpha vs B&H (%)': round(
+                    ml_res['portfolio_return'] - 
+                    self.ai_portfolio_results.get('bench_return', 0), 2
+                ),
+                'Total Trades': ml_res['trades'],
+            })
+        
+        comparison_rows.append({
+            'Model': 'Buy & Hold (Benchmark)',
+            'Portfolio Return (%)': self.ai_portfolio_results.get('bench_return', 0),
+            'Sharpe Ratio': self.ai_portfolio_results.get('bench_sharpe', 0),
+            'Max Drawdown (%)': self.ai_portfolio_results.get('bench_max_dd', 0),
+            'Alpha vs B&H (%)': 0.0,
+            'Total Trades': 0,
+        })
+        
+        comp_df = pd.DataFrame(comparison_rows)
+        comp_df.to_csv("reports/model_comparison.csv", index=False)
+        
+        logger.info(f"\n{comp_df.to_string(index=False)}")
+        logger.info("")
+        
+        # Generate comparison equity curve plot
+        plt.figure(figsize=(16, 8))
+        plt.plot(self.dates, self.agg_ai_equity, label='D3QN (DRL)', color='#00ff88', linewidth=2.5)
+        plt.plot(self.dates, self.agg_bench_equity, label='Buy & Hold', color='#ff3366', linewidth=1.5, alpha=0.7)
+        
+        ml_colors = ['#4488ff', '#ffaa00', '#aa44ff', '#44ffaa']
+        for i, ml_res in enumerate(ml_results):
+            if len(ml_res['equity_curve']) == len(self.dates):
+                color = ml_colors[i % len(ml_colors)]
+                label = ml_res['model_name'].replace('_', ' ').title()
+                plt.plot(self.dates, ml_res['equity_curve'], label=label, 
+                         color=color, linewidth=1.5, linestyle='--', alpha=0.9)
+        
+        plt.title('Model Comparison: DRL vs Traditional ML vs Buy & Hold', fontsize=14, fontweight='bold')
+        plt.ylabel('Total Net Worth (₹)', fontsize=12)
+        plt.xlabel('Date', fontsize=12)
+        plt.legend(fontsize=11)
+        plt.tight_layout()
+        plt.savefig("reports/model_comparison_equity.png", dpi=300)
+        plt.close()
+        
+        # Sharpe comparison bar chart
+        plt.figure(figsize=(10, 6))
+        models = comp_df['Model']
+        sharpes = comp_df['Sharpe Ratio']
+        colors = ['#00ff88' if s > 0 else '#ff3366' for s in sharpes]
+        plt.barh(models, sharpes, color=colors, edgecolor='white', linewidth=0.5)
+        plt.title('Sharpe Ratio Comparison', fontsize=14, fontweight='bold')
+        plt.xlabel('Sharpe Ratio', fontsize=12)
+        plt.axvline(x=0, color='white', linewidth=0.8, alpha=0.5)
+        plt.tight_layout()
+        plt.savefig("reports/sharpe_comparison.png", dpi=300)
+        plt.close()
+        
+        logger.info("Comparative reports saved to 'reports/' directory.")
+        logger.info("=" * 100)

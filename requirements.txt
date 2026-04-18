@@ -7,6 +7,7 @@ scipy
 torch
 scikit-learn
 gymnasium
+xgboost
 
 # Financial Data & Time Series
 yfinance
