@@ -1,4 +1,4 @@
 # from .loader import DataLoader
-from .features import FeatureEngineer
+from .features import FeatureEngineer, align_multi_ticker_data
 
-__all__ = ["DataLoader", "FeatureEngineer"]
+__all__ = ["DataLoader", "FeatureEngineer", "align_multi_ticker_data"]

@@ -122,6 +122,78 @@ class FeatureEngineer:
             
         return df
 
+def align_multi_ticker_data(multi_ticker_data: dict, min_coverage: float = 0.80):
+    """
+    Align all tickers onto a common date index and produce a 3D numpy array.
+    
+    Steps:
+        1. Filter out tickers with insufficient date coverage.
+        2. Inner-join on dates so every timestep has valid data for ALL tickers.
+        3. Return a (T, N, F) array plus metadata.
+    
+    Args:
+        multi_ticker_data: dict mapping ticker → DataFrame (numeric cols, DatetimeIndex).
+        min_coverage: minimum fraction of the longest ticker's dates a ticker must have.
+    
+    Returns:
+        data_3d:  np.ndarray of shape (T, N, F)
+        tickers:  list of N ticker strings (ordered)
+        dates:    pd.DatetimeIndex of T aligned dates
+        columns:  list of F column names
+    """
+    # --- 1. Filter tickers by date coverage ---
+    max_len = max(len(df) for df in multi_ticker_data.values())
+    threshold = int(max_len * min_coverage)
+
+    valid_tickers = {}
+    for ticker, df in multi_ticker_data.items():
+        if ticker == '^NSEI':
+            continue  # Index is for feature calc only, not tradeable
+        numeric_df = df.select_dtypes(include=[np.number]).copy()
+        if len(numeric_df) >= threshold:
+            valid_tickers[ticker] = numeric_df
+        else:
+            logger.warning(f"Dropping {ticker}: only {len(numeric_df)} rows "
+                           f"(need {threshold})")
+
+    if not valid_tickers:
+        raise ValueError("No tickers passed the coverage filter!")
+
+    # --- 2. Find common date index (inner join) ---
+    common_dates = None
+    for df in valid_tickers.values():
+        idx = df.index
+        common_dates = idx if common_dates is None else common_dates.intersection(idx)
+
+    common_dates = common_dates.sort_values()
+    logger.info(f"Aligned {len(valid_tickers)} tickers on {len(common_dates)} "
+                f"common dates [{common_dates[0].date()} → {common_dates[-1].date()}]")
+
+    # --- 3. Build 3D array ---
+    tickers = sorted(valid_tickers.keys())
+    # Use column list from the first ticker (all should match after feature eng)
+    columns = list(valid_tickers[tickers[0]].columns)
+
+    T = len(common_dates)
+    N = len(tickers)
+    F = len(columns)
+    data_3d = np.empty((T, N, F), dtype=np.float32)
+
+    for j, ticker in enumerate(tickers):
+        df = valid_tickers[ticker].loc[common_dates, columns]
+        data_3d[:, j, :] = df.values.astype(np.float32)
+
+    # Final NaN check
+    nan_count = np.isnan(data_3d).sum()
+    if nan_count > 0:
+        logger.warning(f"Replacing {nan_count} residual NaNs with 0 in aligned data")
+        np.nan_to_num(data_3d, copy=False, nan=0.0)
+
+    logger.info(f"Aligned data tensor shape: ({T}, {N}, {F})  "
+                f"[timesteps, tickers, features]")
+    return data_3d, tickers, common_dates, columns
+
+
 if __name__ == "__main__":
     import logging
     import pandas as pd

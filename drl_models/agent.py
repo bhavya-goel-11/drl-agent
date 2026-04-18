@@ -66,50 +66,77 @@ class NoisyLinear(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Dueling Double DQN Network (D3QN)
-# Splits Q(s,a) into V(s) + A(s,a) streams.
-# - Value stream: learns which market states are inherently good/bad
-# - Advantage stream: learns which action is marginally better
-# This prevents premature convergence because in many market states
-# the action choice barely matters — the dueling architecture learns this.
-# Reference: "Dueling Network Architectures" (Wang et al., 2016)
+# Dueling Double DQN Network — Vectorised Multi-Asset Edition
+#
+# Input:  flattened portfolio state  (batch, N*F + N + 3)
+# Output: per-stock Q-values         (batch, N, 3)
+#
+# Architecture:
+#   Shared backbone  →  Value stream V(s)        (batch, 1)
+#                    →  Advantage stream A(s, a)  (batch, N*3) → (batch, N, 3)
+#   Q(s, a_i) = V(s) + A(s, a_i) - mean_a A(s, ·_i)   per stock
+#
+# The shared value stream captures "how good is this portfolio state overall?"
+# The per-stock advantage captures "which action is marginally best for stock i?"
 # ---------------------------------------------------------------------------
 class DRLAgent(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int):
+    def __init__(self, state_dim: int, action_dim: int, n_stocks: int,
+                 noise_std: float = 0.7):
+        """
+        Args:
+            state_dim:   N*F + N + 3  (flattened observation dimension).
+            action_dim:  3  (Hold / Buy / Sell).
+            n_stocks:    N  (number of tradeable tickers).
+            noise_std:   Initial NoisyNet standard deviation (higher = more
+                         exploration, important for the combinatorial action
+                         space).
+        """
         super(DRLAgent, self).__init__()
+        self.n_stocks = n_stocks
+        self.action_dim = action_dim
         
         # Shared feature extraction backbone with LayerNorm for training stability
         self.feature_layer = nn.Sequential(
-            nn.Linear(state_dim, 256),
-            nn.LayerNorm(256),
+            nn.Linear(state_dim, 512),
+            nn.LayerNorm(512),
             nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.LayerNorm(256),
+            nn.Linear(512, 512),
+            nn.LayerNorm(512),
             nn.ReLU(),
         )
         
-        # Value stream: V(s) — how good is this market state?
+        # Value stream: V(s) — how good is this portfolio state?
         self.value_stream = nn.Sequential(
-            NoisyLinear(256, 128),
+            NoisyLinear(512, 256, std_init=noise_std),
             nn.ReLU(),
-            NoisyLinear(128, 1),
+            NoisyLinear(256, 1, std_init=noise_std),
         )
         
-        # Advantage stream: A(s,a) — how much better is action a vs average?
+        # Advantage stream: A(s, a) for all N stocks × 3 actions
         self.advantage_stream = nn.Sequential(
-            NoisyLinear(256, 128),
+            NoisyLinear(512, 256, std_init=noise_std),
             nn.ReLU(),
-            NoisyLinear(128, action_dim),
+            NoisyLinear(256, n_stocks * action_dim, std_init=noise_std),
         )
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (batch, state_dim)
+        Returns:
+            Q-values: (batch, N, 3)
+        """
         features = self.feature_layer(x)
-        value = self.value_stream(features)
-        advantage = self.advantage_stream(features)
-        # Q(s,a) = V(s) + (A(s,a) - mean(A(s,·)))
-        # Subtracting mean advantage ensures identifiability
-        q_values = value + advantage - advantage.mean(dim=-1, keepdim=True)
-        return q_values
+
+        value = self.value_stream(features)                # (batch, 1)
+        advantage = self.advantage_stream(features)        # (batch, N*3)
+        advantage = advantage.view(-1, self.n_stocks, self.action_dim)  # (batch, N, 3)
+
+        # Q(s,a_i) = V(s) + (A(s,a_i) - mean_a A(s,·_i))
+        q_values = (value.unsqueeze(1)
+                    + advantage
+                    - advantage.mean(dim=2, keepdim=True))
+        return q_values                                    # (batch, N, 3)
     
     def reset_noise(self):
         """Reset noise in all NoisyLinear layers for fresh exploration each step."""
@@ -181,11 +208,14 @@ class PrioritizedReplayBuffer:
     PER_b = 0.4    # Importance sampling exponent (annealed to 1.0 during training)
     PER_b_increment = 0.001  # How fast beta anneals to 1.0
     
-    def __init__(self, capacity: int = 200000):
+    def __init__(self, capacity: int = 500000):
         self.tree = SumTree(capacity)
         self.capacity = capacity
     
     def push(self, state, action, reward, next_state, done):
+        """
+        Store a transition.  `action` can be a scalar or an ndarray (vectorised).
+        """
         # New transitions get maximum priority so they are sampled at least once
         max_priority = np.max(self.tree.tree[-self.tree.capacity:])
         if max_priority == 0:
@@ -273,25 +303,28 @@ class ReplayBuffer:
 
 
 # ---------------------------------------------------------------------------
-# D3QN Trainer: Dueling Double DQN with PER, NoisyNets, Huber Loss
-# Combines all anti-convergence techniques into a single training loop:
-# - Double DQN: policy net selects action, target net evaluates
-# - Huber loss: more robust to outliers than MSE (volatile market rewards)
-# - Soft target update (Polyak): smooth weight transfer prevents oscillation
+# D3QN Trainer: Dueling Double DQN — Vectorised Multi-Asset Edition
+#
+# Key adaptations for the vectorised environment:
+# - Actions are now (batch, N) integer arrays instead of scalars.
+# - Q-values are (batch, N, 3); we gather per-stock Q for the chosen action.
+# - A single portfolio-level scalar reward is broadcast to all N stock heads.
+# - TD errors are averaged across stocks per transition for PER priorities.
 # ---------------------------------------------------------------------------
 class DQNTrainer:
-    def __init__(self, state_dim: int, action_dim: int, lr: float = 1e-4, 
-                 gamma: float = 0.99, tau: float = 0.005):
+    def __init__(self, state_dim: int, action_dim: int, n_stocks: int,
+                 lr: float = 1e-4, gamma: float = 0.99, tau: float = 0.005):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.gamma = gamma
         self.tau = tau
         self.action_dim = action_dim
+        self.n_stocks = n_stocks
         
         # Policy network (actively trains)
-        self.policy_net = DRLAgent(state_dim, action_dim).to(self.device)
+        self.policy_net = DRLAgent(state_dim, action_dim, n_stocks).to(self.device)
         
         # Target network (provides stable Q-value targets via Polyak averaging)
-        self.target_net = DRLAgent(state_dim, action_dim).to(self.device)
+        self.target_net = DRLAgent(state_dim, action_dim, n_stocks).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
         
@@ -301,38 +334,43 @@ class DQNTrainer:
         # In volatile markets, occasional large rewards/losses won't destabilize training
         self.criterion = nn.SmoothL1Loss(reduction='none')
         
-        logger.info(f"Initialized D3QN Trainer on {self.device} | "
-                     f"State: {state_dim} | Action: {action_dim} | τ: {tau}")
+        logger.info(f"Initialized Vectorised D3QN Trainer on {self.device} | "
+                     f"State: {state_dim} | Actions: {action_dim}×{n_stocks} | τ: {tau}")
 
     def train_step(self, states, actions, rewards, next_states, dones,
                    is_weights=None):
         """
-        Double DQN training step with importance sampling correction.
-        
-        Key difference from vanilla DQN:
-        - Action SELECTION uses policy_net (which action is best?)
-        - Action EVALUATION uses target_net (what's that action's value?)
-        This decoupling eliminates the maximization bias that causes
-        Q-value overestimation → premature convergence to greedy policies.
-        """
-        states = torch.FloatTensor(states).to(self.device)
-        actions = torch.LongTensor(actions).unsqueeze(1).to(self.device)
-        rewards = torch.FloatTensor(rewards).unsqueeze(1).to(self.device)
-        next_states = torch.FloatTensor(next_states).to(self.device)
-        dones = torch.FloatTensor(dones).unsqueeze(1).to(self.device)
+        Double DQN training step for vectorised multi-asset actions.
 
-        # Current Q-values from policy network
-        current_q = self.policy_net(states).gather(1, actions)
+        Actions shape:      (batch, N)
+        Q-values shape:     (batch, N, 3)
+        Rewards/dones:      (batch,)  — portfolio-level scalars
+        """
+        states      = torch.FloatTensor(states).to(self.device)       # (B, state_dim)
+        actions     = torch.LongTensor(actions).to(self.device)       # (B, N)
+        rewards     = torch.FloatTensor(rewards).to(self.device)      # (B,)
+        next_states = torch.FloatTensor(next_states).to(self.device)  # (B, state_dim)
+        dones       = torch.FloatTensor(dones).to(self.device)        # (B,)
+
+        # Current Q-values: pick Q of chosen action per stock
+        q_all = self.policy_net(states)                               # (B, N, 3)
+        current_q = q_all.gather(2, actions.unsqueeze(-1)).squeeze(-1)  # (B, N)
 
         with torch.no_grad():
-            # DOUBLE DQN: policy net picks the action, target net evaluates it
-            next_actions = self.policy_net(next_states).argmax(1, keepdim=True)
-            next_q = self.target_net(next_states).gather(1, next_actions)
-            target_q = rewards + (self.gamma * next_q * (1 - dones))
+            # DOUBLE DQN: policy net picks the action, target net evaluates
+            next_q_policy = self.policy_net(next_states)              # (B, N, 3)
+            next_actions = next_q_policy.argmax(dim=2)                # (B, N)
+            next_q_target = self.target_net(next_states) \
+                .gather(2, next_actions.unsqueeze(-1)).squeeze(-1)    # (B, N)
 
-        # Element-wise Huber loss
-        td_errors = current_q - target_q
-        loss = self.criterion(current_q, target_q)
+            # Broadcast portfolio reward to all stock heads
+            target_q = (rewards.unsqueeze(1)
+                        + self.gamma * next_q_target
+                        * (1 - dones.unsqueeze(1)))                   # (B, N)
+
+        # Per-stock Huber loss
+        td_errors = current_q - target_q                              # (B, N)
+        loss = self.criterion(current_q, target_q)                    # (B, N)
         
         # Apply importance sampling weights from PER (if available)
         if is_weights is not None:
@@ -352,7 +390,9 @@ class DQNTrainer:
         self.policy_net.reset_noise()
         self.target_net.reset_noise()
         
-        return loss.item(), td_errors.detach().cpu().numpy().flatten()
+        # Mean |TD-error| per transition for PER priority updates
+        mean_td = td_errors.detach().abs().cpu().numpy().mean(axis=1)  # (B,)
+        return loss.item(), mean_td
 
     def soft_sync_target_network(self):
         """
@@ -375,22 +415,25 @@ class DQNTrainer:
         self.target_net.load_state_dict(self.policy_net.state_dict())
         logger.debug("Target network hard-synced with Policy network.")
 
-    def select_action(self, state: np.ndarray) -> int:
+    def select_action(self, state: np.ndarray) -> np.ndarray:
         """
-        Action selection using NoisyNet (no epsilon needed).
-        The noise in NoisyLinear layers provides state-dependent exploration
-        that naturally decays as the network becomes confident.
+        Select actions for all N stocks simultaneously.
+        
+        Returns:
+            np.ndarray of shape (N,) with values in {0, 1, 2}.
         """
         with torch.no_grad():
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-            q_values = self.policy_net(state_tensor)
-            return q_values.argmax().item()
+            q_values = self.policy_net(state_tensor)      # (1, N, 3)
+            actions = q_values.squeeze(0).argmax(dim=1)   # (N,)
+            return actions.cpu().numpy()
 
     def save_checkpoint(self, filepath: str):
         torch.save({
             'policy_net': self.policy_net.state_dict(),
             'target_net': self.target_net.state_dict(),
             'optimizer': self.optimizer.state_dict(),
+            'n_stocks': self.n_stocks,
         }, filepath)
         logger.info(f"Model checkpoint saved to {filepath}")
 

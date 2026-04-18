@@ -4,222 +4,338 @@ import gymnasium as gym
 from gymnasium import spaces
 from loguru import logger
 from collections import deque
-import random
 
-class TradingEnv(gym.Env):
+
+class VectorizedTradingEnv(gym.Env):
     """
-    Institutional-grade stock trading environment with risk-adjusted rewards.
+    Vectorized multi-asset portfolio trading environment.
     
-    Anti-Convergence Features:
-    1. Rolling Sharpe reward — agent optimizes risk-adjusted returns, not raw PnL
-    2. Drawdown penalty — prevents catastrophic concentration in single stocks
-    3. Volatility-scaled rewards — normalizes reward signal across market regimes
-    4. Inactivity penalty — discourages the "hold cash forever" local optimum
-    5. Trade cost awareness — realistic friction prevents overtrading convergence
+    At every timestep the agent observes the full market state for ALL N stocks
+    simultaneously and outputs a vector of N actions (one per stock).  The reward
+    is computed at the *portfolio* level using risk-adjusted metrics so the agent
+    learns cross-asset allocation, not just single-stock timing.
+    
+    Key Design Choices:
+        • MultiDiscrete([3]*N) action space — compatible with D3QN architecture.
+        • Equal-split capital allocation across simultaneous buy signals.
+        • Portfolio-level Sharpe reward with concentration & diversification terms.
+        • Stratified random sub-windows (252 trading days ≈ 1 year) so every
+          calendar year in the training set is sampled proportionately.
     """
     metadata = {'render.modes': ['human']}
 
-    def __init__(self, data, initial_balance=10000, commission=0.002,
-                 sharpe_window: int = 20, drawdown_penalty_coeff: float = 0.5,
-                 inactivity_penalty: float = -0.0005):
-        super(TradingEnv, self).__init__()
-        
-        # Handle different input data formats (dictionary, groupby object, or plain DataFrame)
-        if isinstance(data, dict):
-            self.tickers = list(data.keys())
-            self.data_dict = {ticker: df.copy().reset_index(drop=True) for ticker, df in data.items()}
-        elif hasattr(data, 'groups'): # Covers DataFrameGroupBy
-            self.tickers = list(data.groups.keys())
-            self.data_dict = {ticker: group.copy().reset_index(drop=True) for ticker, group in data}
-        elif isinstance(data, pd.DataFrame):
-            if 'symbol' in data.columns:
-                grouped = data.groupby('symbol')
-                self.tickers = list(grouped.groups.keys())
-                self.data_dict = {ticker: group.copy().reset_index(drop=True) for ticker, group in grouped}
-            else:
-                self.tickers = ['DEFAULT']
-                self.data_dict = {'DEFAULT': data.copy().reset_index(drop=True)}
-        else:
-            raise ValueError("Unsupported data format. Please provide a dict or grouped DataFrame.")
-            
-        # Ensure pure numeric state space to match required feature constraints without data format crashing
-        for ticker, df in self.data_dict.items():
-            numeric_cols = df.select_dtypes(include=[np.number]).columns
-            self.data_dict[ticker] = df[numeric_cols]
-        
+    def __init__(
+        self,
+        data_3d: np.ndarray,
+        tickers: list,
+        dates: pd.DatetimeIndex,
+        columns: list,
+        initial_balance: float = 10_000_000.0,
+        commission: float = 0.002,
+        window_size: int = 252,
+        sharpe_window: int = 20,
+        drawdown_penalty_coeff: float = 0.5,
+        concentration_penalty_coeff: float = 0.1,
+        diversification_bonus: float = 0.0002,
+    ):
+        """
+        Args:
+            data_3d:   (T, N, F) aligned market data.
+            tickers:   list of N ticker strings.
+            dates:     DatetimeIndex of T dates.
+            columns:   list of F feature column names.
+            initial_balance:  Starting cash for the portfolio.
+            commission:       Round-trip trading cost fraction.
+            window_size:      Number of trading days per episode sub-window.
+            sharpe_window:    Rolling window for Sharpe reward calculation.
+            drawdown_penalty_coeff:  Weight of the drawdown penalty term.
+            concentration_penalty_coeff:  Herfindahl index penalty weight.
+            diversification_bonus:  Bonus per step for holding multiple names.
+        """
+        super().__init__()
+
+        self.data = data_3d                       # (T, N, F)
+        self.tickers = tickers
+        self.dates = dates
+        self.columns = columns
+        self.total_steps, self.n_stocks, self.n_features = data_3d.shape
+
+        # Locate special columns for execution
+        self.close_idx = columns.index('close') if 'close' in columns else -1
+        self.open_idx  = columns.index('open')  if 'open'  in columns else self.close_idx
+
         self.initial_balance = initial_balance
         self.commission = commission
-        
-        # --- Risk-Adjusted Reward Configuration ---
-        self.sharpe_window = sharpe_window
-        self.drawdown_penalty_coeff = drawdown_penalty_coeff
-        self.inactivity_penalty = inactivity_penalty
-        
-        self.active_ticker = random.choice(self.tickers)
-        self.df = self.data_dict[self.active_ticker]
-        
-        # Action space: 0 = Hold, 1 = Buy, 2 = Sell
-        self.action_space = spaces.Discrete(3)
-        
-        num_features = len(self.df.columns)
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(num_features + 3,), dtype=np.float32
-        )
-        
-        # Reward tracking for Sharpe calculation
-        self._returns_buffer = deque(maxlen=sharpe_window)
-        self._peak_net_worth = initial_balance
-        self._hold_counter = 0
-        
-        logger.info(f"Initialized TradingEnv with {len(self.tickers)} tickers. "
-                     f"Target feature shape {self.observation_space.shape} | "
-                     f"Sharpe window: {sharpe_window}")
+        self.window_size = min(window_size, self.total_steps - 1)
 
+        # Reward parameters
+        self.sharpe_window = sharpe_window
+        self.dd_coeff = drawdown_penalty_coeff
+        self.conc_coeff = concentration_penalty_coeff
+        self.div_bonus = diversification_bonus
+
+        # --- Spaces ---
+        # Action: one discrete action per stock  (0=Hold, 1=Buy, 2=Sell)
+        self.action_space = spaces.MultiDiscrete([3] * self.n_stocks)
+
+        # Observation: flattened [market_features | positions | portfolio_state]
+        self.obs_dim = self.n_stocks * self.n_features + self.n_stocks + 3
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32
+        )
+
+        # --- Stratified year sampler ---
+        self._build_year_index()
+
+        # --- Per-episode state (initialized in reset) ---
+        self.cash = initial_balance
+        self.holdings = np.zeros(self.n_stocks, dtype=np.float64)
+        self.start_step = 0
+        self.end_step = 0
+        self.current_step = 0
+        self._returns_buffer = deque(maxlen=sharpe_window)
+        self._peak_value = initial_balance
+
+        logger.info(
+            f"VectorizedTradingEnv initialised — "
+            f"{self.n_stocks} stocks × {self.n_features} features | "
+            f"obs_dim={self.obs_dim} | window={self.window_size} days | "
+            f"T={self.total_steps}"
+        )
+
+    # ------------------------------------------------------------------
+    # Stratified year sampling
+    # ------------------------------------------------------------------
+    def _build_year_index(self):
+        """Map each timestep to its calendar year for stratified sampling."""
+        years = pd.DatetimeIndex(self.dates).year.values
+        self.year_of_step = years
+        unique_years = np.unique(years)
+
+        self.year_to_indices = {}
+        for y in unique_years:
+            self.year_to_indices[y] = np.where(years == y)[0]
+
+        # Track sample counts to enforce proportionate coverage
+        self.year_sample_counts = {y: 0 for y in unique_years}
+        logger.debug(f"Year strata: {list(unique_years)} "
+                     f"({len(unique_years)} distinct years)")
+
+    def _sample_start_index(self) -> int:
+        """Pick a start index using least-sampled-year strategy."""
+        min_count = min(self.year_sample_counts.values())
+        candidates = [y for y, c in self.year_sample_counts.items()
+                      if c == min_count]
+        year = int(np.random.choice(candidates))
+
+        indices = self.year_to_indices[year]
+        # Must leave room for window_size steps
+        valid = indices[indices <= self.total_steps - self.window_size]
+
+        if len(valid) == 0:
+            # Fallback: pick any valid start
+            start = np.random.randint(
+                0, max(1, self.total_steps - self.window_size))
+        else:
+            start = int(np.random.choice(valid))
+
+        self.year_sample_counts[year] += 1
+        return start
+
+    # ------------------------------------------------------------------
+    # Gym interface
+    # ------------------------------------------------------------------
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        
-        # Episodic Ticker Randomization
-        self.active_ticker = random.choice(self.tickers)
-        self.df = self.data_dict[self.active_ticker]
-        
-        self.balance = self.initial_balance
-        self.net_worth = self.initial_balance
-        self.shares_held = 0
-        self.current_step = 0
-        
-        # Reset reward tracking
-        self._returns_buffer.clear()
-        self._peak_net_worth = self.initial_balance
-        self._hold_counter = 0
-        
-        # Gym v26+ requires reset to return (observation, info)
-        return self._next_observation(), {}
 
-    def _next_observation(self):
-        frame = self.df.iloc[self.current_step]
-        
-        # Rolling 200-day Window Normalization (No Future Data!)
-        start_idx = max(0, self.current_step - 200)
-        window = self.df.iloc[start_idx : self.current_step + 1]
-        
-        rolling_mean = window.mean()
-        rolling_std = window.std().replace(0, 1e-8)
-        
-        normalized_frame = (frame - rolling_mean) / rolling_std
-        normalized_array = np.nan_to_num(np.array(normalized_frame.values), nan=0.0)
-        
-        norm_balance = self.balance / self.initial_balance
-        norm_net_worth = self.net_worth / self.initial_balance
-        
-        # USE CURRENT PRICE HERE: The agent evaluates its current state using today's price.
-        current_price = frame.get("close", frame.values[-1])
-        norm_shares = (self.shares_held * current_price) / self.initial_balance
-        
-        obs = np.append(normalized_array, [norm_balance, norm_shares, norm_net_worth])
+        self.start_step = self._sample_start_index()
+        self.end_step = min(self.start_step + self.window_size,
+                            self.total_steps - 1)
+        self.current_step = self.start_step
+
+        self.cash = self.initial_balance
+        self.holdings = np.zeros(self.n_stocks, dtype=np.float64)
+        self._returns_buffer.clear()
+        self._peak_value = self.initial_balance
+
+        return self._build_observation(), {}
+
+    def step(self, actions: np.ndarray):
+        """
+        Execute one time-step across all N stocks.
+
+        Args:
+            actions: np.ndarray of shape (N,) with values in {0, 1, 2}.
+
+        Returns:
+            obs, reward, terminated, truncated, info
+        """
+        actions = np.asarray(actions, dtype=np.int64)
+        prev_value = self._portfolio_value()
+
+        # --- Execution at next-day open ---
+        exec_step = self.current_step + 1
+        if exec_step >= self.end_step:
+            # Episode over — return terminal
+            obs = np.zeros(self.obs_dim, dtype=np.float32)
+            return obs, 0.0, True, False, self._info(prev_value)
+
+        exec_prices = self.data[exec_step, :, self.open_idx]   # (N,)
+
+        buy_mask  = (actions == 1) & (self.holdings == 0)
+        sell_mask = (actions == 2) & (self.holdings > 0)
+
+        # --- Sell first (frees cash) ---
+        for i in np.where(sell_mask)[0]:
+            revenue = self.holdings[i] * exec_prices[i]
+            fee = revenue * self.commission
+            self.cash += (revenue - fee)
+            self.holdings[i] = 0
+
+        # --- Buy with equal-split ---
+        num_buys = int(buy_mask.sum())
+        if num_buys > 0:
+            cash_per_stock = self.cash / num_buys
+            for i in np.where(buy_mask)[0]:
+                max_cost_per_share = exec_prices[i] * (1 + self.commission)
+                if max_cost_per_share <= 0:
+                    continue
+                shares = int(cash_per_stock // max_cost_per_share)
+                if shares > 0:
+                    cost = shares * exec_prices[i] * (1 + self.commission)
+                    self.cash -= cost
+                    self.holdings[i] = shares
+
+        # --- Advance time ---
+        self.current_step = exec_step
+        terminated = self.current_step >= self.end_step - 1
+
+        new_value = self._portfolio_value()
+        step_return = ((new_value - prev_value) / prev_value
+                       if prev_value > 0 else 0.0)
+
+        reward = self._calculate_reward(step_return, actions)
+
+        obs = (self._build_observation() if not terminated
+               else np.zeros(self.obs_dim, dtype=np.float32))
+
+        return obs, reward, terminated, False, self._info(new_value)
+
+    # ------------------------------------------------------------------
+    # Observation
+    # ------------------------------------------------------------------
+    def _build_observation(self) -> np.ndarray:
+        frame = self.data[self.current_step]  # (N, F)
+
+        # 200-day rolling Z-score normalisation (no future data)
+        lookback_start = max(self.start_step, self.current_step - 200)
+        window = self.data[lookback_start: self.current_step + 1]  # (W, N, F)
+
+        rolling_mean = window.mean(axis=0)   # (N, F)
+        rolling_std  = window.std(axis=0)    # (N, F)
+        rolling_std  = np.where(rolling_std < 1e-8, 1e-8, rolling_std)
+
+        normalised = (frame - rolling_mean) / rolling_std
+        normalised = np.nan_to_num(normalised, nan=0.0)
+
+        market_flat = normalised.flatten()  # (N*F,)
+
+        # Per-stock position value (normalised)
+        close_prices = self.data[self.current_step, :, self.close_idx]
+        position_vals = (self.holdings * close_prices) / self.initial_balance
+
+        # Portfolio summary
+        total_equity = self.cash + np.sum(self.holdings * close_prices)
+        self._peak_value = max(self._peak_value, total_equity)
+        drawdown = ((self._peak_value - total_equity) / self._peak_value
+                    if self._peak_value > 0 else 0.0)
+
+        portfolio_state = np.array([
+            self.cash / self.initial_balance,
+            total_equity / self.initial_balance,
+            drawdown,
+        ])
+
+        obs = np.concatenate([market_flat, position_vals, portfolio_state])
         return obs.astype(np.float32)
 
-    def _calculate_reward(self, step_return: float, action: int) -> float:
+    # ------------------------------------------------------------------
+    # Reward
+    # ------------------------------------------------------------------
+    def _portfolio_value(self) -> float:
+        close_prices = self.data[self.current_step, :, self.close_idx]
+        return float(self.cash + np.sum(self.holdings * close_prices))
+
+    def _calculate_reward(self, step_return: float, actions: np.ndarray) -> float:
         """
-        Multi-component risk-adjusted reward function.
-        
-        This is the KEY anti-premature-convergence mechanism:
-        - Raw PnL reward chases momentum → agent converges on high-beta stocks
-        - Sharpe reward balances return vs risk → agent learns robust strategies
-        - Drawdown penalty prevents catastrophic positions
-        - Inactivity penalty prevents the "do nothing" local optimum
-        
-        Reference: Papers S0952197625032270 (EAAI) and S2667305325001486 (ISA)
+        Portfolio-level risk-adjusted reward.
+
+        Components:
+            1. Step return (base PnL signal).
+            2. Rolling Sharpe (risk-adjusted quality).
+            3. Drawdown penalty (catastrophic loss prevention).
+            4. Concentration penalty (Herfindahl — punish single-stock bets).
+            5. Diversification bonus (reward holding multiple names).
         """
-        # 1. Base: step-by-step return (scaled)
         self._returns_buffer.append(step_return)
-        
-        # 2. Rolling Sharpe component (only when we have enough data)
+
+        # 1 — Rolling Sharpe
         sharpe_reward = 0.0
         if len(self._returns_buffer) >= 5:
-            returns_arr = np.array(self._returns_buffer)
-            mean_ret = returns_arr.mean()
-            std_ret = returns_arr.std()
-            if std_ret > 1e-8:
-                # Differential Sharpe: reward improvement in risk-adjusted terms
-                sharpe_reward = mean_ret / std_ret
+            arr = np.array(self._returns_buffer)
+            mu, sigma = arr.mean(), arr.std()
+            if sigma > 1e-8:
+                sharpe_reward = mu / sigma
             else:
-                sharpe_reward = mean_ret * 10.0  # Pure positive returns with zero vol → reward
-        
-        # 3. Drawdown penalty — penalize being far below peak
-        self._peak_net_worth = max(self._peak_net_worth, self.net_worth)
-        drawdown = (self._peak_net_worth - self.net_worth) / self._peak_net_worth
-        dd_penalty = -self.drawdown_penalty_coeff * (drawdown ** 2) if drawdown > 0.02 else 0.0
-        
-        # 4. Inactivity penalty — prevent "hold cash" local optimum
-        if action == 0:  # Hold
-            self._hold_counter += 1
+                sharpe_reward = mu * 10.0
+
+        # 2 — Drawdown penalty
+        pv = self._portfolio_value()
+        self._peak_value = max(self._peak_value, pv)
+        dd = (self._peak_value - pv) / self._peak_value if self._peak_value > 0 else 0.0
+        dd_penalty = -self.dd_coeff * (dd ** 2) if dd > 0.02 else 0.0
+
+        # 3 — Concentration penalty (Herfindahl index of position weights)
+        close_prices = self.data[self.current_step, :, self.close_idx]
+        position_values = self.holdings * close_prices
+        total_pos = position_values.sum()
+        if total_pos > 0:
+            weights = position_values / total_pos
+            hhi = float(np.sum(weights ** 2))
+            conc_penalty = -self.conc_coeff * hhi
         else:
-            self._hold_counter = 0
-        
-        inactivity = self.inactivity_penalty * max(0, self._hold_counter - 20) if self.shares_held == 0 and self.balance > self.initial_balance * 0.95 else 0.0
-        
-        # 5. Combine components with balanced weights
+            conc_penalty = 0.0
+
+        # 4 — Diversification bonus
+        num_held = int(np.sum(self.holdings > 0))
+        div_bonus = (self.div_bonus * (num_held / self.n_stocks)
+                     if num_held >= 3 else 0.0)
+
         reward = (
-            0.4 * step_return +          # Base PnL signal 
-            0.4 * sharpe_reward * 0.1 +   # Risk-adjusted quality 
-            dd_penalty +                   # Drawdown punishment
-            inactivity                     # Anti-inactivity
+            0.4 * step_return
+            + 0.4 * sharpe_reward * 0.1
+            + dd_penalty
+            + conc_penalty
+            + div_bonus
         )
-        
+
         return float(np.clip(reward, -1.0, 1.0))
 
-    def step(self, action):
-        # 1. Record the net worth BEFORE the market moves
-        prev_net_worth = self.net_worth
-        
-        # Execute at TOMORROW'S Open (or next available price)
-        execution_step = min(self.current_step + 1, len(self.df) - 1)
-        # Fallback to 'close' if your dataset doesn't have an 'open' column
-        execution_price = self.df.iloc[execution_step].get("open", self.df.iloc[execution_step].get("close"))
-        
-        # 3. Execute Trade (with transaction friction)
-        if action == 1 and self.balance >= execution_price: # Buy
-            shares_bought = self.balance // execution_price
-            cost = shares_bought * execution_price
-            fee = cost * self.commission
-            self.balance -= (cost + fee)
-            self.shares_held += shares_bought
-            
-        elif action == 2 and self.shares_held > 0: # Sell
-            revenue = self.shares_held * execution_price
-            fee = revenue * self.commission
-            self.balance += (revenue - fee)
-            self.shares_held = 0
-            
-        # 4. Move time forward to tomorrow!
-        self.current_step += 1
-        done = self.current_step >= len(self.df) - 1
-        
-        # 5. Calculate NEW net worth using TOMORROW'S price
-        if not done:
-            new_price = self.df.iloc[self.current_step].get("close", self.df.iloc[self.current_step].values[-1])
-        else:
-            new_price = execution_price
-            
-        self.net_worth = self.balance + (self.shares_held * new_price)
-        
-        # 6. Step-by-step return (not raw PnL)
-        step_return = (self.net_worth - prev_net_worth) / prev_net_worth if prev_net_worth > 0 else 0.0
-        
-        # 7. Risk-adjusted reward
-        reward = self._calculate_reward(step_return, action)
-        
-        obs = self._next_observation() if not done else np.zeros(self.observation_space.shape, dtype=np.float32)
-        info = {
-            'net_worth': self.net_worth, 
-            'step_profit': self.net_worth - prev_net_worth,
-            'step_return': step_return,
-            'ticker': self.active_ticker,
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _info(self, portfolio_value: float) -> dict:
+        return {
+            'portfolio_value': portfolio_value,
+            'cash': self.cash,
+            'num_positions': int(np.sum(self.holdings > 0)),
+            'window': f"{self.dates[self.start_step].date()}→"
+                      f"{self.dates[self.end_step].date()}",
         }
-        
-        # Gym v26+ requires step to return (obs, reward, terminated, truncated, info)
-        return obs, reward, done, False, info
 
     def render(self, mode='human', close=False):
-        profit = self.net_worth - self.initial_balance
-        print(f"Step: {self.current_step}, Net Worth: ${self.net_worth:.2f}, Total Profit: ${profit:.2f}")
+        pv = self._portfolio_value()
+        profit = pv - self.initial_balance
+        held = int(np.sum(self.holdings > 0))
+        print(f"Step {self.current_step} | PV: ₹{pv:,.0f} | "
+              f"Profit: ₹{profit:,.0f} | Positions: {held}/{self.n_stocks}")
