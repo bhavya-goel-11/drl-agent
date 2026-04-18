@@ -20,12 +20,6 @@ htmlcov/
 *.db
 *.sqlite3
 
-# Model Checkpoints & Weights
-*.pth
-*.pt
-*.h5
-*.onnx
-
 # Data Files
 *.csv
 *.tsv
