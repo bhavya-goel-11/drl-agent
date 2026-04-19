@@ -35,9 +35,8 @@ class VectorizedTradingEnv(gym.Env):
         window_size: int = 252,
         sharpe_window: int = 20,
         drawdown_penalty_coeff: float = 0.5,
-        concentration_penalty_coeff: float = 0.3,
-        diversification_bonus: float = 0.001,
-        turnover_penalty_coeff: float = 0.0005,
+        concentration_penalty_coeff: float = 0.1,
+        diversification_bonus: float = 0.0002,
     ):
         """
         Args:
@@ -52,7 +51,6 @@ class VectorizedTradingEnv(gym.Env):
             drawdown_penalty_coeff:  Weight of the drawdown penalty term.
             concentration_penalty_coeff:  Herfindahl index penalty weight.
             diversification_bonus:  Bonus per step for holding multiple names.
-            turnover_penalty_coeff:  Penalty for excessive trading (churn).
         """
         super().__init__()
 
@@ -75,12 +73,6 @@ class VectorizedTradingEnv(gym.Env):
         self.dd_coeff = drawdown_penalty_coeff
         self.conc_coeff = concentration_penalty_coeff
         self.div_bonus = diversification_bonus
-        self.turnover_coeff = turnover_penalty_coeff
-
-        # --- Pre-compute global rolling statistics for observation normalisation ---
-        # Using a 200-day trailing window across the FULL dataset (not episode-local)
-        # so the agent always sees well-conditioned observations from step 0.
-        self._precompute_global_zscore()
 
         # --- Spaces ---
         # Action: one discrete action per stock  (0=Hold, 1=Buy, 2=Sell)
@@ -98,7 +90,6 @@ class VectorizedTradingEnv(gym.Env):
         # --- Per-episode state (initialized in reset) ---
         self.cash = initial_balance
         self.holdings = np.zeros(self.n_stocks, dtype=np.float64)
-        self.prev_holdings = np.zeros(self.n_stocks, dtype=np.float64)
         self.start_step = 0
         self.end_step = 0
         self.current_step = 0
@@ -111,31 +102,6 @@ class VectorizedTradingEnv(gym.Env):
             f"obs_dim={self.obs_dim} | window={self.window_size} days | "
             f"T={self.total_steps}"
         )
-
-    # ------------------------------------------------------------------
-    # Pre-computed global normalisation
-    # ------------------------------------------------------------------
-    def _precompute_global_zscore(self):
-        """
-        Pre-compute 200-day trailing mean and std for each (stock, feature)
-        across the FULL dataset.  This eliminates the episode-boundary problem
-        where early timesteps in a window had degenerate observations.
-        """
-        T, N, F = self.data.shape
-        self._global_mean = np.zeros((T, N, F), dtype=np.float32)
-        self._global_std  = np.ones((T, N, F), dtype=np.float32)
-
-        lookback = 200
-        # Use cumulative sums for efficient rolling computation
-        for t in range(T):
-            start = max(0, t - lookback)
-            window = self.data[start:t + 1]               # (W, N, F)
-            self._global_mean[t] = window.mean(axis=0)
-            std = window.std(axis=0)
-            std = np.where(std < 1e-8, 1e-8, std)
-            self._global_std[t] = std
-
-        logger.info(f"Pre-computed global Z-score stats for {T} timesteps")
 
     # ------------------------------------------------------------------
     # Stratified year sampling
@@ -189,7 +155,6 @@ class VectorizedTradingEnv(gym.Env):
 
         self.cash = self.initial_balance
         self.holdings = np.zeros(self.n_stocks, dtype=np.float64)
-        self.prev_holdings = np.zeros(self.n_stocks, dtype=np.float64)
         self._returns_buffer.clear()
         self._peak_value = self.initial_balance
 
@@ -207,9 +172,6 @@ class VectorizedTradingEnv(gym.Env):
         """
         actions = np.asarray(actions, dtype=np.int64)
         prev_value = self._portfolio_value()
-
-        # Save previous holdings for turnover calculation
-        self.prev_holdings = self.holdings.copy()
 
         # --- Execution at next-day open ---
         exec_step = self.current_step + 1
@@ -263,21 +225,18 @@ class VectorizedTradingEnv(gym.Env):
     # Observation
     # ------------------------------------------------------------------
     def _build_observation(self) -> np.ndarray:
-        """
-        Build observation using pre-computed global Z-score statistics.
-        This ensures well-conditioned observations from the very first step
-        of every episode, eliminating the degenerate-observation problem.
-        """
         frame = self.data[self.current_step]  # (N, F)
 
-        # Use pre-computed global stats instead of episode-local window
-        rolling_mean = self._global_mean[self.current_step]   # (N, F)
-        rolling_std  = self._global_std[self.current_step]    # (N, F)
+        # 200-day rolling Z-score normalisation (no future data)
+        lookback_start = max(self.start_step, self.current_step - 200)
+        window = self.data[lookback_start: self.current_step + 1]  # (W, N, F)
+
+        rolling_mean = window.mean(axis=0)   # (N, F)
+        rolling_std  = window.std(axis=0)    # (N, F)
+        rolling_std  = np.where(rolling_std < 1e-8, 1e-8, rolling_std)
 
         normalised = (frame - rolling_mean) / rolling_std
         normalised = np.nan_to_num(normalised, nan=0.0)
-        # Clip extreme Z-scores to prevent outlier observations
-        normalised = np.clip(normalised, -5.0, 5.0)
 
         market_flat = normalised.flatten()  # (N*F,)
 
@@ -311,74 +270,56 @@ class VectorizedTradingEnv(gym.Env):
         """
         Portfolio-level risk-adjusted reward.
 
-        All components are deliberately scaled to similar magnitudes (~0.001–0.01)
-        so no single term dominates the gradient signal.
-
         Components:
-            1. Step return (base PnL signal) — scaled ×100 so a 0.1% daily
-               return becomes 0.1, comparable to other terms.
-            2. Rolling Sharpe (risk-adjusted quality) — scaled down to match.
-            3. Drawdown penalty (catastrophic loss prevention) — activates
-               from 0.5% drawdown (not 2%), so the agent learns risk early.
+            1. Step return (base PnL signal).
+            2. Rolling Sharpe (risk-adjusted quality).
+            3. Drawdown penalty (catastrophic loss prevention).
             4. Concentration penalty (Herfindahl — punish single-stock bets).
             5. Diversification bonus (reward holding multiple names).
-            6. Turnover penalty — discourage excessive churn.
         """
         self._returns_buffer.append(step_return)
 
-        # 1 — Step return scaled to be the primary signal
-        #     A typical daily return of 0.001 (0.1%) becomes 0.1
-        scaled_return = step_return * 100.0
-
-        # 2 — Rolling Sharpe (scaled down to comparable magnitude)
+        # 1 — Rolling Sharpe
         sharpe_reward = 0.0
         if len(self._returns_buffer) >= 5:
             arr = np.array(self._returns_buffer)
             mu, sigma = arr.mean(), arr.std()
             if sigma > 1e-8:
-                # Raw Sharpe can be 0.1–2.0, scale down by 0.05
-                sharpe_reward = (mu / sigma) * 0.05
+                sharpe_reward = mu / sigma
             else:
-                # When std ≈ 0, agent is flat — give zero, not a degenerate spike
-                sharpe_reward = 0.0
+                sharpe_reward = mu * 10.0
 
-        # 3 — Drawdown penalty (activate from 0.5% drawdown)
+        # 2 — Drawdown penalty
         pv = self._portfolio_value()
         self._peak_value = max(self._peak_value, pv)
         dd = (self._peak_value - pv) / self._peak_value if self._peak_value > 0 else 0.0
-        dd_penalty = -self.dd_coeff * (dd ** 2) if dd > 0.005 else 0.0
+        dd_penalty = -self.dd_coeff * (dd ** 2) if dd > 0.02 else 0.0
 
-        # 4 — Concentration penalty (Herfindahl index of position weights)
+        # 3 — Concentration penalty (Herfindahl index of position weights)
         close_prices = self.data[self.current_step, :, self.close_idx]
         position_values = self.holdings * close_prices
         total_pos = position_values.sum()
         if total_pos > 0:
             weights = position_values / total_pos
             hhi = float(np.sum(weights ** 2))
-            # Ideal HHI for N stocks = 1/N ≈ 0.022; single-stock = 1.0
-            conc_penalty = -self.conc_coeff * max(0.0, hhi - 1.0 / self.n_stocks)
+            conc_penalty = -self.conc_coeff * hhi
         else:
             conc_penalty = 0.0
 
-        # 5 — Diversification bonus
+        # 4 — Diversification bonus
         num_held = int(np.sum(self.holdings > 0))
         div_bonus = (self.div_bonus * (num_held / self.n_stocks)
                      if num_held >= 3 else 0.0)
 
-        # 6 — Turnover penalty (discourage churning)
-        changed = np.sum((self.holdings > 0) != (self.prev_holdings > 0))
-        turnover_penalty = -self.turnover_coeff * changed
-
         reward = (
-            0.5 * scaled_return
-            + 0.3 * sharpe_reward
+            0.4 * step_return
+            + 0.4 * sharpe_reward * 0.1
             + dd_penalty
             + conc_penalty
             + div_bonus
-            + turnover_penalty
         )
 
-        return float(np.clip(reward, -5.0, 5.0))
+        return float(np.clip(reward, -1.0, 1.0))
 
     # ------------------------------------------------------------------
     # Helpers
