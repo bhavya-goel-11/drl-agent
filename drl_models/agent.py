@@ -64,6 +64,15 @@ class NoisyLinear(nn.Module):
             bias = self.bias_mu
         return F.linear(x, weight, bias)
 
+    def reset_sigma(self):
+        """Reset only the noise scales, preserving learned weights."""
+        self.weight_sigma.data.fill_(self.std_init / math.sqrt(self.in_features))
+        self.bias_sigma.data.fill_(self.std_init / math.sqrt(self.out_features))
+
+    def get_sigma_mean(self) -> float:
+        """Return mean absolute sigma for monitoring noise collapse."""
+        return float(self.weight_sigma.data.abs().mean().item())
+
 
 # ---------------------------------------------------------------------------
 # Dueling Double DQN Network — Vectorised Multi-Asset Edition
@@ -96,13 +105,16 @@ class DRLAgent(nn.Module):
         self.action_dim = action_dim
         
         # Shared feature extraction backbone with LayerNorm for training stability
+        # Wider layers (768) to handle the high-dimensional multi-stock state
         self.feature_layer = nn.Sequential(
-            nn.Linear(state_dim, 512),
+            nn.Linear(state_dim, 768),
+            nn.LayerNorm(768),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(768, 512),
             nn.LayerNorm(512),
             nn.ReLU(),
-            nn.Linear(512, 512),
-            nn.LayerNorm(512),
-            nn.ReLU(),
+            nn.Dropout(0.1),
         )
         
         # Value stream: V(s) — how good is this portfolio state?
@@ -114,9 +126,9 @@ class DRLAgent(nn.Module):
         
         # Advantage stream: A(s, a) for all N stocks × 3 actions
         self.advantage_stream = nn.Sequential(
-            NoisyLinear(512, 256, std_init=noise_std),
+            NoisyLinear(512, 512, std_init=noise_std),
             nn.ReLU(),
-            NoisyLinear(256, n_stocks * action_dim, std_init=noise_std),
+            NoisyLinear(512, n_stocks * action_dim, std_init=noise_std),
         )
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -143,6 +155,20 @@ class DRLAgent(nn.Module):
         for module in self.modules():
             if isinstance(module, NoisyLinear):
                 module.reset_noise()
+
+    def reset_sigma(self):
+        """Force re-initialization of noise scales if they collapse."""
+        for module in self.modules():
+            if isinstance(module, NoisyLinear):
+                module.reset_sigma()
+
+    def get_sigma_stats(self) -> float:
+        """Monitor NoisyNet sigma magnitude — early warning for noise collapse."""
+        sigmas = []
+        for module in self.modules():
+            if isinstance(module, NoisyLinear):
+                sigmas.append(module.get_sigma_mean())
+        return float(np.mean(sigmas)) if sigmas else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +354,8 @@ class DQNTrainer:
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
         
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr, eps=1.5e-4)
+        self.optimizer = optim.AdamW(self.policy_net.parameters(), lr=lr,
+                                     eps=1e-5, weight_decay=1e-5)
         
         # Huber loss is more robust to reward outliers than MSE
         # In volatile markets, occasional large rewards/losses won't destabilize training
@@ -382,8 +409,10 @@ class DQNTrainer:
         self.optimizer.zero_grad()
         loss.backward()
         
-        # Gradient clipping to prevent exploding gradients during volatile market data
-        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=10.0)
+        # Tighter gradient clipping to prevent volatile market windows from
+        # destabilizing representations. With 46 stock heads all receiving the
+        # same noisy portfolio reward, gradient variance is inherently high.
+        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=1.0)
         self.optimizer.step()
         
         # Reset NoisyNet noise for next forward pass
@@ -415,9 +444,14 @@ class DQNTrainer:
         self.target_net.load_state_dict(self.policy_net.state_dict())
         logger.debug("Target network hard-synced with Policy network.")
 
-    def select_action(self, state: np.ndarray) -> np.ndarray:
+    def select_action(self, state: np.ndarray, epsilon: float = 0.0) -> np.ndarray:
         """
         Select actions for all N stocks simultaneously.
+        
+        Uses per-stock epsilon perturbation instead of all-or-nothing:
+        each stock independently has an `epsilon` chance of a random action.
+        This ensures exploration is distributed across the portfolio rather
+        than the agent either fully exploring or fully exploiting.
         
         Returns:
             np.ndarray of shape (N,) with values in {0, 1, 2}.
@@ -426,7 +460,15 @@ class DQNTrainer:
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             q_values = self.policy_net(state_tensor)      # (1, N, 3)
             actions = q_values.squeeze(0).argmax(dim=1)   # (N,)
-            return actions.cpu().numpy()
+            actions = actions.cpu().numpy()
+
+        # Per-stock epsilon perturbation
+        if epsilon > 0:
+            random_mask = np.random.random(self.n_stocks) < epsilon
+            random_actions = np.random.randint(0, self.action_dim, size=self.n_stocks)
+            actions = np.where(random_mask, random_actions, actions)
+
+        return actions
 
     def save_checkpoint(self, filepath: str):
         torch.save({
