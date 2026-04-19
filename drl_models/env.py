@@ -319,7 +319,7 @@ class VectorizedTradingEnv(gym.Env):
             + div_bonus
         )
 
-        return float(np.clip(reward, -1.0, 1.0))
+        return float(np.clip(reward, -5.0, 5.0))
 
     # ------------------------------------------------------------------
     # Helpers

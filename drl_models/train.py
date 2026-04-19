@@ -119,7 +119,7 @@ def main():
         columns=columns,
         initial_balance=10_000_000.0,   # ₹1 Cr portfolio
         commission=0.002,
-        window_size=252,                # ~1 year sub-windows
+        window_size=126,                # ~6 month sub-windows (2× more independent episodes)
     )
 
     state_dim  = env.observation_space.shape[0]
@@ -130,7 +130,7 @@ def main():
     # ------------------------------------------------------------------
     lr            = 5e-4
     gamma         = 0.99
-    episodes      = 3000
+    episodes      = 6000
     batch_size    = 256
     tau           = 0.005
     warmup_episodes = 50     # Fill buffer before training
@@ -154,7 +154,8 @@ def main():
     frame_count = 0
     best_sharpe  = -float('inf')
     best_reward  = -float('inf')
-    patience     = 250
+    best_pnl     = -float('inf')
+    patience     = 500
     no_improve   = 0
     reward_history = []
 
@@ -231,16 +232,28 @@ def main():
                 f"{info.get('window', '')}"
             )
 
-        # --- Checkpointing ---
+        # --- Multi-metric checkpointing ---
+        pv = info.get('portfolio_value', env.initial_balance)
+        ep_pnl = pv - env.initial_balance
+        improved = False
+
         if ep_sharpe > best_sharpe and episode > warmup_episodes:
             logger.info(f"  ★ New best Sharpe: {best_sharpe:.2f} → "
                         f"{ep_sharpe:.2f}.  Saving checkpoint...")
             best_sharpe = ep_sharpe
             trainer.save_checkpoint(
                 "drl_models/best_universal_dqn_trader.pth")
-            no_improve = 0
-        elif total_reward > best_reward and episode > warmup_episodes:
+            improved = True
+
+        if total_reward > best_reward and episode > warmup_episodes:
             best_reward = total_reward
+            improved = True
+
+        if ep_pnl > best_pnl and episode > warmup_episodes:
+            best_pnl = ep_pnl
+            improved = True
+
+        if improved:
             no_improve = 0
         else:
             no_improve += 1

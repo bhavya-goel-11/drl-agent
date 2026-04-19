@@ -19,8 +19,9 @@ htmlcov/
 # Databases
 *.db
 *.sqlite3
-
+*.pth
 # Data Files
+
 *.csv
 *.tsv
 *.npy
