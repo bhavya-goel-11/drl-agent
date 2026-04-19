@@ -28,7 +28,6 @@ htmlcov/
 *.npz
 
 # Generated Reports & Outputs
-reports/
 
 # Logs
 logs/

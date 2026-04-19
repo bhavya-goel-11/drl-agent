@@ -1,0 +1,54 @@
+{
+  "XGBoost": {
+    "model_name": "XGBoost",
+    "total_return": 87.27,
+    "bench_return": 79.25,
+    "alpha": 8.02,
+    "sharpe": 1.54,
+    "max_drawdown": -21.94,
+    "calmar": 1.33,
+    "sortino": 2.28,
+    "win_rate": 54.67,
+    "volatility": 14.58,
+    "trades": 490
+  },
+  "RandomForest": {
+    "model_name": "RandomForest",
+    "total_return": 81.43,
+    "bench_return": 79.25,
+    "alpha": 2.18,
+    "sharpe": 1.21,
+    "max_drawdown": -18.67,
+    "calmar": 1.45,
+    "sortino": 1.72,
+    "win_rate": 53.18,
+    "volatility": 18.1,
+    "trades": 418
+  },
+  "D3QN_Agent": {
+    "model_name": "D3QN_Agent",
+    "total_return": 65.98,
+    "bench_return": 79.25,
+    "alpha": -13.27,
+    "sharpe": 1.41,
+    "max_drawdown": -20.53,
+    "calmar": 1.07,
+    "sortino": 1.91,
+    "win_rate": 55.75,
+    "volatility": 12.88,
+    "trades": 23
+  },
+  "Ensemble": {
+    "model_name": "Ensemble",
+    "total_return": 78.22,
+    "bench_return": 79.25,
+    "alpha": -1.02,
+    "sharpe": 1.58,
+    "max_drawdown": -18.59,
+    "calmar": 1.4,
+    "sortino": 2.29,
+    "win_rate": 57.24,
+    "volatility": 12.98,
+    "trades": 931
+  }
+}
