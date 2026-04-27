@@ -2,6 +2,10 @@ import pandas as pd
 import numpy as np
 import torch
 import math
+import os
+import json
+import uuid
+from datetime import datetime, timezone
 from drl_models.env import VectorizedTradingEnv
 from drl_models.agent import DQNTrainer, PrioritizedReplayBuffer
 from loguru import logger
@@ -22,7 +26,8 @@ from loguru import logger
 #     action space (3^N possible action vectors per step).
 # ---------------------------------------------------------------------------
 
-TRAIN_CUTOFF = "2023-01-01"
+TRAIN_END = "2020-12-31"
+VAL_END = "2022-12-31"
 
 
 def _cosine_annealing_lr(optimizer, episode: int, total_episodes: int,
@@ -36,6 +41,149 @@ def _cosine_annealing_lr(optimizer, episode: int, total_episodes: int,
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     return lr
+
+
+def _build_validation_state(
+    data_3d: np.ndarray,
+    current_step: int,
+    holdings: np.ndarray,
+    cash: float,
+    initial_balance: float,
+    close_idx: int,
+) -> np.ndarray:
+    frame = data_3d[current_step]  # (N, F)
+
+    lookback_start = max(0, current_step - 200)
+    window = data_3d[lookback_start: current_step + 1]
+
+    rolling_mean = window.mean(axis=0)
+    rolling_std = window.std(axis=0)
+    rolling_std = np.where(rolling_std < 1e-8, 1e-8, rolling_std)
+
+    normalised = (frame - rolling_mean) / rolling_std
+    normalised = np.nan_to_num(normalised, nan=0.0)
+    market_flat = normalised.flatten()
+
+    close_prices = data_3d[current_step, :, close_idx]
+    position_vals = (holdings * close_prices) / initial_balance
+
+    total_equity = cash + np.sum(holdings * close_prices)
+    drawdown = 0.0
+    portfolio_state = np.array([
+        cash / initial_balance,
+        total_equity / initial_balance,
+        drawdown,
+    ])
+
+    obs = np.concatenate([market_flat, position_vals, portfolio_state])
+    return obs.astype(np.float32)
+
+
+def _evaluate_on_validation(
+    trainer: DQNTrainer,
+    data_3d: np.ndarray,
+    tickers: list,
+    columns: list,
+    initial_balance: float = 10_000_000.0,
+    commission: float = 0.002,
+):
+    if data_3d.shape[0] < 2:
+        return {'return': 0.0, 'sharpe': 0.0, 'max_drawdown': 0.0}
+
+    close_idx = columns.index('close') if 'close' in columns else -1
+    open_idx = columns.index('open') if 'open' in columns else close_idx
+
+    n_stocks = len(tickers)
+    cash = initial_balance
+    holdings = np.zeros(n_stocks, dtype=np.float64)
+    portfolio_history = []
+
+    was_training = trainer.policy_net.training
+    trainer.policy_net.eval()
+
+    with torch.no_grad():
+        for step in range(0, data_3d.shape[0] - 1):
+            close_prices = data_3d[step, :, close_idx]
+            pv = float(cash + np.sum(holdings * close_prices))
+            portfolio_history.append(pv)
+
+            state = _build_validation_state(
+                data_3d=data_3d,
+                current_step=step,
+                holdings=holdings,
+                cash=cash,
+                initial_balance=initial_balance,
+                close_idx=close_idx,
+            )
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(trainer.device)
+            q_vals = trainer.policy_net(state_tensor)  # (1, N, 3)
+            actions = q_vals.squeeze(0).argmax(dim=1).cpu().numpy()
+
+            exec_prices = data_3d[step + 1, :, open_idx]
+            buy_mask = (actions == 1) & (holdings == 0)
+            sell_mask = (actions == 2) & (holdings > 0)
+
+            for i in np.where(sell_mask)[0]:
+                revenue = holdings[i] * exec_prices[i]
+                fee = revenue * commission
+                cash += (revenue - fee)
+                holdings[i] = 0
+
+            num_buys = int(buy_mask.sum())
+            if num_buys > 0:
+                cash_per_stock = cash / num_buys
+                for i in np.where(buy_mask)[0]:
+                    max_cost = exec_prices[i] * (1 + commission)
+                    if max_cost <= 0:
+                        continue
+                    shares = int(cash_per_stock // max_cost)
+                    if shares > 0:
+                        cost = shares * exec_prices[i] * (1 + commission)
+                        cash -= cost
+                        holdings[i] = shares
+
+    final_close = data_3d[-1, :, close_idx]
+    final_pv = float(cash + np.sum(holdings * final_close))
+    portfolio_history.append(final_pv)
+
+    eq = np.array(portfolio_history, dtype=np.float64)
+    total_return = ((eq[-1] / eq[0]) - 1) * 100 if eq[0] > 0 else 0.0
+
+    pct = pd.Series(eq).pct_change().dropna()
+    sharpe = 0.0
+    if len(pct) > 1 and pct.std() > 0:
+        sharpe = (pct.mean() / pct.std()) * np.sqrt(252)
+
+    rolling_max = np.maximum.accumulate(eq)
+    dd = (eq - rolling_max) / np.where(rolling_max == 0, 1.0, rolling_max)
+    max_dd = dd.min() * 100
+
+    if was_training:
+        trainer.policy_net.train()
+
+    return {
+        'return': float(total_return),
+        'sharpe': float(sharpe),
+        'max_drawdown': float(max_dd),
+    }
+
+
+def _date_range_str(date_index: pd.DatetimeIndex) -> str:
+    if len(date_index) == 0:
+        return "N/A"
+    return f"{date_index[0].date()} → {date_index[-1].date()}"
+
+
+def _split_boundary(split_date: str, dates: pd.DatetimeIndex) -> pd.Timestamp:
+    """Return a split timestamp compatible with the aligned date index timezone."""
+    ts = pd.Timestamp(split_date)
+    index_tz = pd.DatetimeIndex(dates).tz
+
+    if index_tz is None:
+        return ts.tz_localize(None) if ts.tzinfo is not None else ts
+    if ts.tzinfo is None:
+        return ts.tz_localize(index_tz)
+    return ts.tz_convert(index_tz)
 
 
 def main():
@@ -52,9 +200,8 @@ def main():
     db = SessionLocal()
     try:
         logger.info("Fetching all tickers from PostgreSQL "
-                     f"(Training Firewall: pre-{TRAIN_CUTOFF})...")
+                    f"(Split: train<= {TRAIN_END}, val<= {VAL_END}, oos>{VAL_END})...")
         records = (db.query(HistoricalData)
-                     .filter(HistoricalData.date < TRAIN_CUTOFF)
                      .order_by(HistoricalData.date.asc())
                      .all())
 
@@ -110,12 +257,46 @@ def main():
     logger.info(f"Tickers ({n_stocks}): {tickers}")
 
     # ------------------------------------------------------------------
-    # 5.  Create vectorised environment
+    # 5.  Strict temporal split
+    # ------------------------------------------------------------------
+    train_end_dt = _split_boundary(TRAIN_END, dates)
+    val_end_dt = _split_boundary(VAL_END, dates)
+
+    train_mask = dates <= train_end_dt
+    val_mask = (dates > train_end_dt) & (dates <= val_end_dt)
+    oos_mask = dates > val_end_dt
+
+    train_data_3d = data_3d[train_mask]
+    val_data_3d = data_3d[val_mask]
+    oos_data_3d = data_3d[oos_mask]
+
+    train_dates = dates[train_mask]
+    val_dates = dates[val_mask]
+    oos_dates = dates[oos_mask]
+
+    logger.info(
+        f"Split sizes | Train: {train_data_3d.shape[0]} steps "
+        f"[{_date_range_str(train_dates)}] | "
+        f"Val: {val_data_3d.shape[0]} steps "
+        f"[{_date_range_str(val_dates)}] | "
+        f"OOS: {oos_data_3d.shape[0]} steps "
+        f"[{_date_range_str(oos_dates)}]"
+    )
+
+    if train_data_3d.shape[0] < 253:
+        logger.error("Training split is too short for 252-day windows.")
+        return
+    if val_data_3d.shape[0] < 2:
+        logger.error("Validation split is too short to evaluate.")
+        return
+
+    # ------------------------------------------------------------------
+    # 6.  Create vectorised environment
     # ------------------------------------------------------------------
     env = VectorizedTradingEnv(
-        data_3d=data_3d,
+        data_3d=train_data_3d,
         tickers=tickers,
-        dates=dates,
+        dates=train_dates,
         columns=columns,
         initial_balance=10_000_000.0,   # ₹1 Cr portfolio
         commission=0.002,
@@ -126,7 +307,7 @@ def main():
     action_dim = 3  # Hold / Buy / Sell
 
     # ------------------------------------------------------------------
-    # 6.  Hyperparameters
+    # 7.  Hyperparameters
     # ------------------------------------------------------------------
     lr            = 5e-4
     gamma         = 0.99
@@ -134,22 +315,42 @@ def main():
     batch_size    = 256
     tau           = 0.005
     warmup_episodes = 50     # Fill buffer before training
+    val_eval_interval = 10
 
     # ------------------------------------------------------------------
-    # 7.  Initialise agent & buffer
+    # 8.  Initialise agent & buffer
     # ------------------------------------------------------------------
     trainer = DQNTrainer(state_dim, action_dim, n_stocks, lr=lr,
                          gamma=gamma, tau=tau)
     buffer  = PrioritizedReplayBuffer(capacity=500_000)
 
+    run_config = {
+        'train_end': TRAIN_END,
+        'val_end': VAL_END,
+        'lr': lr,
+        'gamma': gamma,
+        'episodes': episodes,
+        'batch_size': batch_size,
+        'tau': tau,
+        'warmup_episodes': warmup_episodes,
+        'val_eval_interval': val_eval_interval,
+        'buffer_capacity': 500_000,
+        'window_size': 252,
+        'commission': 0.002,
+        'initial_balance': 10_000_000.0,
+    }
+
     logger.info(f"Env ready.  State={state_dim}  Actions=3×{n_stocks}")
     logger.info(f"Config: LR={lr} | γ={gamma} | τ={tau} | Batch={batch_size}")
     logger.info(f"Buffer: PER(500K) | Architecture: Vectorised Dueling D3QN + NoisyNet")
-    logger.info(f"Episodes: {episodes} | Warmup: {warmup_episodes}")
+    logger.info(
+        f"Episodes: {episodes} | Warmup: {warmup_episodes} | "
+        f"Val interval: {val_eval_interval}"
+    )
     logger.info("Commencing training loop...")
 
     # ------------------------------------------------------------------
-    # 8.  Training loop
+    # 9.  Training loop
     # ------------------------------------------------------------------
     frame_count = 0
     best_sharpe  = -float('inf')
@@ -157,6 +358,7 @@ def main():
     patience     = 250
     no_improve   = 0
     reward_history = []
+    last_val_metrics = {'return': 0.0, 'sharpe': 0.0, 'max_drawdown': 0.0}
 
     for episode in range(episodes):
         current_lr = _cosine_annealing_lr(trainer.optimizer, episode,
@@ -178,7 +380,8 @@ def main():
             next_state, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
 
-            total_reward += reward
+            reward_scalar = float(np.mean(reward))
+            total_reward += reward_scalar
             step_ret = ((info.get('portfolio_value', env.initial_balance)
                          - env.initial_balance) / env.initial_balance)
             episode_returns.append(step_ret)
@@ -231,6 +434,23 @@ def main():
                 f"{info.get('window', '')}"
             )
 
+        # --- Periodic validation ---
+        if (episode + 1) % val_eval_interval == 0:
+            last_val_metrics = _evaluate_on_validation(
+                trainer=trainer,
+                data_3d=val_data_3d,
+                tickers=tickers,
+                columns=columns,
+                initial_balance=10_000_000.0,
+                commission=0.002,
+            )
+            logger.info(
+                f"Validation Ep {episode+1:>4}/{episodes} | "
+                f"Return: {last_val_metrics['return']:>7.2f}% | "
+                f"Sharpe: {last_val_metrics['sharpe']:>6.2f} | "
+                f"MaxDD: {last_val_metrics['max_drawdown']:>7.2f}%"
+            )
+
         # --- Checkpointing ---
         if ep_sharpe > best_sharpe and episode > warmup_episodes:
             logger.info(f"  ★ New best Sharpe: {best_sharpe:.2f} → "
@@ -253,14 +473,51 @@ def main():
             break
 
     # ------------------------------------------------------------------
-    # 9.  Save final weights
+    # 10.  Save final weights
     # ------------------------------------------------------------------
-    trainer.save_checkpoint("drl_models/universal_dqn_trader.pth")
+    final_checkpoint_path = "drl_models/universal_dqn_trader.pth"
+    trainer.save_checkpoint(final_checkpoint_path)
+
+    final_val_metrics = _evaluate_on_validation(
+        trainer=trainer,
+        data_3d=val_data_3d,
+        tickers=tickers,
+        columns=columns,
+        initial_balance=10_000_000.0,
+        commission=0.002,
+    )
+    if last_val_metrics != final_val_metrics:
+        last_val_metrics = final_val_metrics
+
+    # ------------------------------------------------------------------
+    # 11. Run logging
+    # ------------------------------------------------------------------
+    os.makedirs("reports/experiments", exist_ok=True)
+    ts = datetime.now(timezone.utc)
+    run_id = f"d3qn_{ts.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    experiment_log = {
+        'timestamp': ts.isoformat(),
+        'run_id': run_id,
+        'config': run_config,
+        'final_validation_return': round(last_val_metrics['return'], 4),
+        'final_validation_sharpe': round(last_val_metrics['sharpe'], 4),
+        'final_validation_max_drawdown': round(last_val_metrics['max_drawdown'], 4),
+        'checkpoint_path': final_checkpoint_path,
+    }
+    experiment_log_path = f"reports/experiments/{run_id}.json"
+    with open(experiment_log_path, 'w') as f:
+        json.dump(experiment_log, f, indent=2)
+    logger.info(f"Run log saved: {experiment_log_path}")
 
     logger.info("=" * 80)
     logger.info("Training Complete!")
     logger.info(f"  Best Sharpe (approx): {best_sharpe:.2f}")
     logger.info(f"  Best Reward:          {best_reward:.3f}")
+    logger.info(
+        f"  Final Validation:     Return={last_val_metrics['return']:.2f}% | "
+        f"Sharpe={last_val_metrics['sharpe']:.2f} | "
+        f"MaxDD={last_val_metrics['max_drawdown']:.2f}%"
+    )
     logger.info(f"  Total Frames:         {frame_count:,}")
     logger.info(f"  Tickers:              {n_stocks}")
     logger.info("  Model weights saved for backtesting.")

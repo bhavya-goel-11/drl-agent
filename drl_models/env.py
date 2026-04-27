@@ -11,14 +11,13 @@ class VectorizedTradingEnv(gym.Env):
     Vectorized multi-asset portfolio trading environment.
     
     At every timestep the agent observes the full market state for ALL N stocks
-    simultaneously and outputs a vector of N actions (one per stock).  The reward
-    is computed at the *portfolio* level using risk-adjusted metrics so the agent
-    learns cross-asset allocation, not just single-stock timing.
+    simultaneously and outputs a vector of N actions (one per stock). The reward
+    is computed as a per-stock vector using configurable reward variants.
     
     Key Design Choices:
         • MultiDiscrete([3]*N) action space — compatible with D3QN architecture.
         • Equal-split capital allocation across simultaneous buy signals.
-        • Portfolio-level Sharpe reward with concentration & diversification terms.
+        • Configurable per-stock reward variants (A/B/C/D).
         • Stratified random sub-windows (252 trading days ≈ 1 year) so every
           calendar year in the training set is sampled proportionately.
     """
@@ -34,9 +33,9 @@ class VectorizedTradingEnv(gym.Env):
         commission: float = 0.002,
         window_size: int = 252,
         sharpe_window: int = 20,
-        drawdown_penalty_coeff: float = 0.5,
-        concentration_penalty_coeff: float = 0.1,
-        diversification_bonus: float = 0.0002,
+        reward_type: str = 'A',
+        drawdown_penalty_coeff: float = 0.1,
+        turnover_penalty_coeff: float = 0.01,
     ):
         """
         Args:
@@ -47,10 +46,10 @@ class VectorizedTradingEnv(gym.Env):
             initial_balance:  Starting cash for the portfolio.
             commission:       Round-trip trading cost fraction.
             window_size:      Number of trading days per episode sub-window.
-            sharpe_window:    Rolling window for Sharpe reward calculation.
+            sharpe_window:    Rolling window for downside-volatility estimation.
+            reward_type:      Reward variant selector: 'A', 'B', 'C', or 'D'.
             drawdown_penalty_coeff:  Weight of the drawdown penalty term.
-            concentration_penalty_coeff:  Herfindahl index penalty weight.
-            diversification_bonus:  Bonus per step for holding multiple names.
+            turnover_penalty_coeff:  Weight of the turnover penalty term.
         """
         super().__init__()
 
@@ -70,9 +69,12 @@ class VectorizedTradingEnv(gym.Env):
 
         # Reward parameters
         self.sharpe_window = sharpe_window
-        self.dd_coeff = drawdown_penalty_coeff
-        self.conc_coeff = concentration_penalty_coeff
-        self.div_bonus = diversification_bonus
+        self.reward_type = str(reward_type).upper()
+        if self.reward_type not in {'A', 'B', 'C', 'D'}:
+            logger.warning(f"Unknown reward_type='{reward_type}', defaulting to 'A'")
+            self.reward_type = 'A'
+        self.drawdown_penalty_coeff = drawdown_penalty_coeff
+        self.turnover_penalty_coeff = turnover_penalty_coeff
 
         # --- Spaces ---
         # Action: one discrete action per stock  (0=Hold, 1=Buy, 2=Sell)
@@ -171,19 +173,24 @@ class VectorizedTradingEnv(gym.Env):
             obs, reward, terminated, truncated, info
         """
         actions = np.asarray(actions, dtype=np.int64)
+        prev_step = self.current_step
         prev_value = self._portfolio_value()
+        prev_holdings = self.holdings.copy()
 
         # --- Execution at next-day open ---
         exec_step = self.current_step + 1
         if exec_step >= self.end_step:
             # Episode over — return terminal
             obs = np.zeros(self.obs_dim, dtype=np.float32)
-            return obs, 0.0, True, False, self._info(prev_value)
+            reward = np.zeros(self.n_stocks, dtype=np.float32)
+            return obs, reward, True, False, self._info(prev_value)
 
         exec_prices = self.data[exec_step, :, self.open_idx]   # (N,)
 
         buy_mask  = (actions == 1) & (self.holdings == 0)
         sell_mask = (actions == 2) & (self.holdings > 0)
+        buy_executed = np.zeros(self.n_stocks, dtype=bool)
+        sell_executed = np.zeros(self.n_stocks, dtype=bool)
 
         # --- Sell first (frees cash) ---
         for i in np.where(sell_mask)[0]:
@@ -191,6 +198,7 @@ class VectorizedTradingEnv(gym.Env):
             fee = revenue * self.commission
             self.cash += (revenue - fee)
             self.holdings[i] = 0
+            sell_executed[i] = True
 
         # --- Buy with equal-split ---
         num_buys = int(buy_mask.sum())
@@ -205,16 +213,24 @@ class VectorizedTradingEnv(gym.Env):
                     cost = shares * exec_prices[i] * (1 + self.commission)
                     self.cash -= cost
                     self.holdings[i] = shares
+                    buy_executed[i] = True
 
         # --- Advance time ---
         self.current_step = exec_step
         terminated = self.current_step >= self.end_step - 1
 
         new_value = self._portfolio_value()
-        step_return = ((new_value - prev_value) / prev_value
-                       if prev_value > 0 else 0.0)
 
-        reward = self._calculate_reward(step_return, actions)
+        prev_close_prices = self.data[prev_step, :, self.close_idx]
+        curr_close_prices = self.data[self.current_step, :, self.close_idx]
+        reward = self._calculate_stock_rewards(
+            prev_close_prices=prev_close_prices,
+            exec_prices=exec_prices,
+            curr_close_prices=curr_close_prices,
+            prev_holdings=prev_holdings,
+            buy_executed=buy_executed,
+            sell_executed=sell_executed,
+        )
 
         obs = (self._build_observation() if not terminated
                else np.zeros(self.obs_dim, dtype=np.float32))
@@ -266,60 +282,90 @@ class VectorizedTradingEnv(gym.Env):
         close_prices = self.data[self.current_step, :, self.close_idx]
         return float(self.cash + np.sum(self.holdings * close_prices))
 
-    def _calculate_reward(self, step_return: float, actions: np.ndarray) -> float:
+    def _calculate_stock_rewards(
+        self,
+        prev_close_prices: np.ndarray,
+        exec_prices: np.ndarray,
+        curr_close_prices: np.ndarray,
+        prev_holdings: np.ndarray,
+        buy_executed: np.ndarray,
+        sell_executed: np.ndarray,
+    ) -> np.ndarray:
         """
-        Portfolio-level risk-adjusted reward.
+        Per-stock reward vector used for multi-head Q-learning.
 
-        Components:
-            1. Step return (base PnL signal).
-            2. Rolling Sharpe (risk-adjusted quality).
-            3. Drawdown penalty (catastrophic loss prevention).
-            4. Concentration penalty (Herfindahl — punish single-stock bets).
-            5. Diversification bonus (reward holding multiple names).
+        Configurable reward variants:
+            A: step_return - transaction_cost - drawdown_penalty
+            B: log_return - drawdown_penalty
+            C: (step_return - equal_weight_index_return) - drawdown_penalty
+            D: step_return + downside_vol_penalty - turnover_penalty
         """
-        self._returns_buffer.append(step_return)
+        rewards = np.zeros(self.n_stocks, dtype=np.float32)
+        stock_returns = np.zeros(self.n_stocks, dtype=np.float32)
 
-        # 1 — Rolling Sharpe
-        sharpe_reward = 0.0
-        if len(self._returns_buffer) >= 5:
-            arr = np.array(self._returns_buffer)
-            mu, sigma = arr.mean(), arr.std()
-            if sigma > 1e-8:
-                sharpe_reward = mu / sigma
-            else:
-                sharpe_reward = mu * 10.0
+        held_and_not_sold = (prev_holdings > 0) & (~sell_executed)
+        if np.any(held_and_not_sold):
+            stock_returns[held_and_not_sold] = (
+                (curr_close_prices[held_and_not_sold] - prev_close_prices[held_and_not_sold])
+                / (prev_close_prices[held_and_not_sold] + 1e-12)
+            ).astype(np.float32)
 
-        # 2 — Drawdown penalty
+        if np.any(buy_executed):
+            stock_returns[buy_executed] = (
+                (curr_close_prices[buy_executed] - exec_prices[buy_executed])
+                / (exec_prices[buy_executed] + 1e-12)
+            ).astype(np.float32)
+
+        if np.any(sell_executed):
+            stock_returns[sell_executed] = (
+                (exec_prices[sell_executed] - prev_close_prices[sell_executed])
+                / (prev_close_prices[sell_executed] + 1e-12)
+            ).astype(np.float32)
+
+        traded = buy_executed | sell_executed
+        transaction_cost = self.commission * traded.astype(np.float32)
+        is_active = traded | (prev_holdings > 0) | (self.holdings > 0)
+
+        # Drawdown penalty (scalar, broadcast across active heads)
         pv = self._portfolio_value()
         self._peak_value = max(self._peak_value, pv)
-        dd = (self._peak_value - pv) / self._peak_value if self._peak_value > 0 else 0.0
-        dd_penalty = -self.dd_coeff * (dd ** 2) if dd > 0.02 else 0.0
+        drawdown = ((self._peak_value - pv) / self._peak_value
+                    if self._peak_value > 0 else 0.0)
+        drawdown_penalty = self.drawdown_penalty_coeff * drawdown
 
-        # 3 — Concentration penalty (Herfindahl index of position weights)
-        close_prices = self.data[self.current_step, :, self.close_idx]
-        position_values = self.holdings * close_prices
-        total_pos = position_values.sum()
-        if total_pos > 0:
-            weights = position_values / total_pos
-            hhi = float(np.sum(weights ** 2))
-            conc_penalty = -self.conc_coeff * hhi
+        # Equal-weight index return uses cross-sectional close-to-close move
+        equal_weight_index_return = float(np.mean(
+            (curr_close_prices - prev_close_prices) / (prev_close_prices + 1e-12)
+        ))
+
+        # Rolling downside volatility penalty over active-step return history
+        active_step_return = float(stock_returns[is_active].mean()) if np.any(is_active) else 0.0
+        self._returns_buffer.append(active_step_return)
+        downside_vol_penalty = 0.0
+        if len(self._returns_buffer) > 1:
+            buf = np.array(self._returns_buffer, dtype=np.float32)
+            downside = buf[buf < 0]
+            if len(downside) > 1:
+                downside_vol_penalty = -float(np.std(downside))
+
+        turnover = float(np.sum(traded)) / float(max(1, self.n_stocks))
+        turnover_penalty = self.turnover_penalty_coeff * turnover
+
+        if self.reward_type == 'A':
+            base = stock_returns - transaction_cost - drawdown_penalty
+        elif self.reward_type == 'B':
+            log_returns = np.log1p(np.clip(stock_returns, -0.999999, None))
+            base = log_returns - drawdown_penalty
+        elif self.reward_type == 'C':
+            base = (stock_returns - equal_weight_index_return) - drawdown_penalty
+        elif self.reward_type == 'D':
+            base = stock_returns + downside_vol_penalty - turnover_penalty
         else:
-            conc_penalty = 0.0
+            base = stock_returns - transaction_cost - drawdown_penalty
 
-        # 4 — Diversification bonus
-        num_held = int(np.sum(self.holdings > 0))
-        div_bonus = (self.div_bonus * (num_held / self.n_stocks)
-                     if num_held >= 3 else 0.0)
-
-        reward = (
-            0.4 * step_return
-            + 0.4 * sharpe_reward * 0.1
-            + dd_penalty
-            + conc_penalty
-            + div_bonus
-        )
-
-        return float(np.clip(reward, -1.0, 1.0))
+        rewards[is_active] = base[is_active].astype(np.float32)
+        rewards[~is_active] = 0.0
+        return rewards
 
     # ------------------------------------------------------------------
     # Helpers

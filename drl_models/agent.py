@@ -66,18 +66,20 @@ class NoisyLinear(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Dueling Double DQN Network — Vectorised Multi-Asset Edition
+# Dueling Double DQN Network — Shared Asset Encoder Edition
 #
 # Input:  flattened portfolio state  (batch, N*F + N + 3)
 # Output: per-stock Q-values         (batch, N, 3)
 #
 # Architecture:
-#   Shared backbone  →  Value stream V(s)        (batch, 1)
-#                    →  Advantage stream A(s, a)  (batch, N*3) → (batch, N, 3)
-#   Q(s, a_i) = V(s) + A(s, a_i) - mean_a A(s, ·_i)   per stock
-#
-# The shared value stream captures "how good is this portfolio state overall?"
-# The per-stock advantage captures "which action is marginally best for stock i?"
+#   1) Parse state into:
+#      - per-stock market features (N, F)
+#      - per-stock position scalar (N, 1)
+#      - portfolio state (3), broadcast to every stock
+#   2) SharedEncoder processes each stock independently -> (N, 64)
+#   3) PortfolioContext = mean over stocks -> (1, 64), broadcast to all stocks
+#   4) Concatenate stock embedding + context -> (N, 128)
+#   5) Per-stock dueling heads output Q-values (N, 3)
 # ---------------------------------------------------------------------------
 class DRLAgent(nn.Module):
     def __init__(self, state_dim: int, action_dim: int, n_stocks: int,
@@ -94,31 +96,40 @@ class DRLAgent(nn.Module):
         super(DRLAgent, self).__init__()
         self.n_stocks = n_stocks
         self.action_dim = action_dim
-        
-        # Shared feature extraction backbone with LayerNorm for training stability
-        self.feature_layer = nn.Sequential(
-            nn.Linear(state_dim, 512),
-            nn.LayerNorm(512),
-            nn.ReLU(),
-            nn.Linear(512, 512),
-            nn.LayerNorm(512),
+
+        # State layout is [N*F market features | N position values | 3 portfolio scalars]
+        market_dim = state_dim - n_stocks - 3
+        if market_dim <= 0 or market_dim % n_stocks != 0:
+            raise ValueError(
+                f"Invalid state_dim={state_dim} for n_stocks={n_stocks}. "
+                "Expected state_dim = N*F + N + 3."
+            )
+        self.market_features_per_stock = market_dim // n_stocks
+        self.features_per_stock = self.market_features_per_stock + 1 + 3
+
+        # Shared encoder: same MLP applied independently to every stock
+        self.shared_encoder = nn.Sequential(
+            nn.Linear(self.features_per_stock, 64),
+            nn.LayerNorm(64),
             nn.ReLU(),
         )
-        
-        # Value stream: V(s) — how good is this portfolio state?
+
+        combined_dim = 128  # [stock_embedding(64) | portfolio_context(64)]
+
+        # Per-stock value stream V_i(s): how favorable current state is for stock i
         self.value_stream = nn.Sequential(
-            NoisyLinear(512, 256, std_init=noise_std),
+            NoisyLinear(combined_dim, 128, std_init=noise_std),
             nn.ReLU(),
-            NoisyLinear(256, 1, std_init=noise_std),
+            NoisyLinear(128, 1, std_init=noise_std),
         )
-        
-        # Advantage stream: A(s, a) for all N stocks × 3 actions
+
+        # Per-stock advantage stream A_i(s, a): action preference for stock i
         self.advantage_stream = nn.Sequential(
-            NoisyLinear(512, 256, std_init=noise_std),
+            NoisyLinear(combined_dim, 128, std_init=noise_std),
             nn.ReLU(),
-            NoisyLinear(256, n_stocks * action_dim, std_init=noise_std),
+            NoisyLinear(128, action_dim, std_init=noise_std),
         )
-        
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -126,18 +137,48 @@ class DRLAgent(nn.Module):
         Returns:
             Q-values: (batch, N, 3)
         """
-        features = self.feature_layer(x)
+        batch_size = x.size(0)
 
-        value = self.value_stream(features)                # (batch, 1)
-        advantage = self.advantage_stream(features)        # (batch, N*3)
-        advantage = advantage.view(-1, self.n_stocks, self.action_dim)  # (batch, N, 3)
+        market_end = self.n_stocks * self.market_features_per_stock
+        position_end = market_end + self.n_stocks
 
-        # Q(s,a_i) = V(s) + (A(s,a_i) - mean_a A(s,·_i))
-        q_values = (value.unsqueeze(1)
-                    + advantage
-                    - advantage.mean(dim=2, keepdim=True))
+        market_flat = x[:, :market_end]                   # (B, N*F)
+        position_vals = x[:, market_end:position_end]     # (B, N)
+        portfolio_state = x[:, position_end:]             # (B, 3)
+
+        market_features = market_flat.reshape(
+            batch_size, self.n_stocks, self.market_features_per_stock
+        )                                                 # (B, N, F)
+        position_feature = position_vals.unsqueeze(-1)    # (B, N, 1)
+        portfolio_broadcast = portfolio_state.unsqueeze(1).expand(
+            -1, self.n_stocks, -1
+        )                                                 # (B, N, 3)
+
+        per_stock_features = torch.cat(
+            [market_features, position_feature, portfolio_broadcast],
+            dim=2
+        )                                                 # (B, N, F+4)
+
+        encoded_flat = self.shared_encoder(
+            per_stock_features.reshape(batch_size * self.n_stocks, self.features_per_stock)
+        )                                                 # (B*N, 64)
+        encoded_stocks = encoded_flat.reshape(batch_size, self.n_stocks, 64)  # (B, N, 64)
+
+        portfolio_context = encoded_stocks.mean(dim=1, keepdim=True)  # (B, 1, 64)
+        context_expanded = portfolio_context.expand(-1, self.n_stocks, -1)  # (B, N, 64)
+
+        combined = torch.cat([encoded_stocks, context_expanded], dim=2)  # (B, N, 128)
+        combined_flat = combined.reshape(batch_size * self.n_stocks, 128)  # (B*N, 128)
+
+        value = self.value_stream(combined_flat).reshape(batch_size, self.n_stocks, 1)
+        advantage = self.advantage_stream(combined_flat).reshape(
+            batch_size, self.n_stocks, self.action_dim
+        )
+
+        # Per-stock dueling aggregation
+        q_values = value + advantage - advantage.mean(dim=2, keepdim=True)
         return q_values                                    # (batch, N, 3)
-    
+
     def reset_noise(self):
         """Reset noise in all NoisyLinear layers for fresh exploration each step."""
         for module in self.modules():
@@ -214,8 +255,9 @@ class PrioritizedReplayBuffer:
     
     def push(self, state, action, reward, next_state, done):
         """
-        Store a transition.  `action` can be a scalar or an ndarray (vectorised).
+        Store a transition. `action` and `reward` can be vectorised arrays.
         """
+        reward = np.asarray(reward, dtype=np.float32)
         # New transitions get maximum priority so they are sampled at least once
         max_priority = np.max(self.tree.tree[-self.tree.capacity:])
         if max_priority == 0:
@@ -285,6 +327,7 @@ class ReplayBuffer:
         self.buffer = deque(maxlen=capacity)
     
     def push(self, state, action, reward, next_state, done):
+        reward = np.asarray(reward, dtype=np.float32)
         self.buffer.append((state, action, reward, next_state, done))
     
     def sample(self, batch_size: int):
@@ -308,7 +351,7 @@ class ReplayBuffer:
 # Key adaptations for the vectorised environment:
 # - Actions are now (batch, N) integer arrays instead of scalars.
 # - Q-values are (batch, N, 3); we gather per-stock Q for the chosen action.
-# - A single portfolio-level scalar reward is broadcast to all N stock heads.
+# - Rewards are now per-stock vectors (batch, N), one reward per stock head.
 # - TD errors are averaged across stocks per transition for PER priorities.
 # ---------------------------------------------------------------------------
 class DQNTrainer:
@@ -344,11 +387,12 @@ class DQNTrainer:
 
         Actions shape:      (batch, N)
         Q-values shape:     (batch, N, 3)
-        Rewards/dones:      (batch,)  — portfolio-level scalars
+        Rewards shape:      (batch, N)  — per-stock reward vectors
+        Dones shape:        (batch,)
         """
         states      = torch.FloatTensor(states).to(self.device)       # (B, state_dim)
         actions     = torch.LongTensor(actions).to(self.device)       # (B, N)
-        rewards     = torch.FloatTensor(rewards).to(self.device)      # (B,)
+        rewards     = torch.FloatTensor(rewards).to(self.device)      # (B, N)
         next_states = torch.FloatTensor(next_states).to(self.device)  # (B, state_dim)
         dones       = torch.FloatTensor(dones).to(self.device)        # (B,)
 
@@ -363,8 +407,7 @@ class DQNTrainer:
             next_q_target = self.target_net(next_states) \
                 .gather(2, next_actions.unsqueeze(-1)).squeeze(-1)    # (B, N)
 
-            # Broadcast portfolio reward to all stock heads
-            target_q = (rewards.unsqueeze(1)
+            target_q = (rewards
                         + self.gamma * next_q_target
                         * (1 - dones.unsqueeze(1)))                   # (B, N)
 

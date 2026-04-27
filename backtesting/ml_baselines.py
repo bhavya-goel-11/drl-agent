@@ -325,9 +325,23 @@ class MLBaselineTrader:
         # Attach DRL results if provided
         if drl_equity is not None and drl_dates is not None:
             bench = results[list(results.keys())[0]]['bench_curve']
+            drl_trade_count = 0
+            drl_ledger_path = "reports/detailed_trade_ledger.csv"
+            if os.path.exists(drl_ledger_path):
+                try:
+                    drl_trades_df = pd.read_csv(drl_ledger_path)
+                    if 'Action' in drl_trades_df.columns:
+                        drl_trade_count = int(
+                            len(drl_trades_df[drl_trades_df['Action'] != 'HOLD'])
+                        )
+                    else:
+                        drl_trade_count = int(len(drl_trades_df))
+                except Exception as e:
+                    logger.warning(f"Failed to load DRL trade ledger: {e}")
+
             drl_metrics = self._compute_metrics(
                 drl_equity, bench, 'D3QN_Agent',
-                trades=23  # from existing backtest
+                trades=drl_trade_count
             )
             drl_metrics['equity_curve'] = drl_equity
             drl_metrics['bench_curve'] = bench
