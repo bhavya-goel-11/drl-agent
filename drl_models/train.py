@@ -127,9 +127,7 @@ def _evaluate_on_validation(
                 initial_balance=initial_balance,
                 close_idx=close_idx,
             )
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(trainer.device)
-            q_vals = trainer.policy_net(state_tensor)  # (1, N, 3)
-            actions = q_vals.squeeze(0).argmax(dim=1).cpu().numpy()
+            actions = trainer.select_action(state)
             action_counts += np.bincount(actions, minlength=3)[:3]
 
             exec_prices = data_3d[step + 1, :, open_idx]

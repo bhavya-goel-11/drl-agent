@@ -36,6 +36,7 @@ class VectorizedTradingEnv(gym.Env):
         reward_type: str = 'A',
         drawdown_penalty_coeff: float = 0.1,
         turnover_penalty_coeff: float = 0.01,
+        invalid_action_penalty: float = 0.001,
     ):
         """
         Args:
@@ -50,6 +51,7 @@ class VectorizedTradingEnv(gym.Env):
             reward_type:      Reward variant selector: 'A', 'B', 'C', or 'D'.
             drawdown_penalty_coeff:  Weight of the drawdown penalty term.
             turnover_penalty_coeff:  Weight of the turnover penalty term.
+            invalid_action_penalty:  Per-head penalty for impossible actions.
         """
         super().__init__()
 
@@ -75,6 +77,7 @@ class VectorizedTradingEnv(gym.Env):
             self.reward_type = 'A'
         self.drawdown_penalty_coeff = drawdown_penalty_coeff
         self.turnover_penalty_coeff = turnover_penalty_coeff
+        self.invalid_action_penalty = invalid_action_penalty
 
         # --- Spaces ---
         # Action: one discrete action per stock  (0=Hold, 1=Buy, 2=Sell)
@@ -187,6 +190,10 @@ class VectorizedTradingEnv(gym.Env):
 
         exec_prices = self.data[exec_step, :, self.open_idx]   # (N,)
 
+        invalid_buy = (actions == 1) & (self.holdings > 0)
+        invalid_sell = (actions == 2) & (self.holdings <= 0)
+        invalid_action = invalid_buy | invalid_sell
+
         buy_mask  = (actions == 1) & (self.holdings == 0)
         sell_mask = (actions == 2) & (self.holdings > 0)
         buy_executed = np.zeros(self.n_stocks, dtype=bool)
@@ -231,6 +238,7 @@ class VectorizedTradingEnv(gym.Env):
             buy_executed=buy_executed,
             sell_executed=sell_executed,
         )
+        reward[invalid_action] -= self.invalid_action_penalty
 
         obs = (self._build_observation() if not terminated
                else np.zeros(self.obs_dim, dtype=np.float32))

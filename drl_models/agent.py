@@ -9,6 +9,29 @@ from collections import deque
 from loguru import logger
 
 
+def mask_invalid_q_values(
+    q_values: torch.Tensor,
+    states: torch.Tensor,
+    n_stocks: int,
+) -> torch.Tensor:
+    """
+    Mask actions that cannot execute under the long-only portfolio rules.
+
+    Action layout is 0=Hold, 1=Buy, 2=Sell. The state layout is
+    [N*F market features | N position values | 3 portfolio scalars].
+    """
+    market_dim = states.shape[1] - n_stocks - 3
+    position_start = market_dim
+    position_end = position_start + n_stocks
+    position_vals = states[:, position_start:position_end]
+    has_position = position_vals > 1e-8
+
+    masked = q_values.clone()
+    masked[:, :, 1] = masked[:, :, 1].masked_fill(has_position, -1e9)
+    masked[:, :, 2] = masked[:, :, 2].masked_fill(~has_position, -1e9)
+    return masked
+
+
 # ---------------------------------------------------------------------------
 # NoisyLinear Layer (Factorised Gaussian Noise)
 # Replaces epsilon-greedy with learned, state-dependent exploration.
@@ -403,6 +426,8 @@ class DQNTrainer:
         with torch.no_grad():
             # DOUBLE DQN: policy net picks the action, target net evaluates
             next_q_policy = self.policy_net(next_states)              # (B, N, 3)
+            next_q_policy = mask_invalid_q_values(
+                next_q_policy, next_states, self.n_stocks)
             next_actions = next_q_policy.argmax(dim=2)                # (B, N)
             next_q_target = self.target_net(next_states) \
                 .gather(2, next_actions.unsqueeze(-1)).squeeze(-1)    # (B, N)
@@ -466,8 +491,11 @@ class DQNTrainer:
             np.ndarray of shape (N,) with values in {0, 1, 2}.
         """
         with torch.no_grad():
+            if self.policy_net.training:
+                self.policy_net.reset_noise()
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             q_values = self.policy_net(state_tensor)      # (1, N, 3)
+            q_values = mask_invalid_q_values(q_values, state_tensor, self.n_stocks)
             actions = q_values.squeeze(0).argmax(dim=1)   # (N,)
             return actions.cpu().numpy()
 
