@@ -1,21 +1,32 @@
-FROM python:3.12-slim
+FROM nvidia/cuda:12.8.2-runtime-ubuntu24.04
 
-# Set environment variables
+# Environment
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV APP_HOME=/app
+ENV VIRTUAL_ENV=/opt/venv
 
-# Set work directory
 WORKDIR $APP_HOME
 
-# Install system dependencies
+# System deps + Python
 RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-venv \
     build-essential \
     libpq-dev \
     gcc \
+    git \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
+# Create virtual environment
+RUN python3 -m venv $VIRTUAL_ENV
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# Optional: make `python` command available
+RUN ln -s /usr/bin/python3 /usr/bin/python
+
+# Install Python deps (cache-friendly)
 COPY requirements.txt .
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
@@ -23,5 +34,5 @@ RUN pip install --upgrade pip && \
 # Copy project
 COPY . .
 
-# Run entrypoint or default command
+# Run app
 CMD ["python", "-m", "execution_engine.main"]

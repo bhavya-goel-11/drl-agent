@@ -16,6 +16,7 @@ from drl_models.env import VectorizedTradingEnv
 
 
 _DATA_CACHE = None
+NO_TRADE_SHARPE_PENALTY = 1.0
 
 
 def _load_split_data():
@@ -177,10 +178,28 @@ def objective(trial: optuna.Trial) -> float:
                 initial_balance=10_000_000.0,
                 commission=0.002,
             )
-            trial.report(val_metrics['sharpe'], episode + 1)
+            reported_sharpe = float(val_metrics['sharpe'])
+            if val_metrics['trades'] == 0:
+                reported_sharpe -= NO_TRADE_SHARPE_PENALTY
+
+            logger.info(
+                f"Trial {trial.number} Ep {episode + 1}/{episodes} | "
+                f"Val Return={val_metrics['return']:.2f}% | "
+                f"Sharpe={val_metrics['sharpe']:.4f} | "
+                f"Objective={reported_sharpe:.4f} | "
+                f"MaxDD={val_metrics['max_drawdown']:.2f}% | "
+                f"Trades={val_metrics['trades']} | "
+                f"AvgPos={val_metrics['avg_positions']:.1f} | "
+                f"Actions H/B/S="
+                f"{val_metrics['action_hold_pct']:.1%}/"
+                f"{val_metrics['action_buy_pct']:.1%}/"
+                f"{val_metrics['action_sell_pct']:.1%}"
+            )
+
+            trial.report(reported_sharpe, episode + 1)
             if trial.should_prune():
                 raise optuna.TrialPruned(
-                    f"Pruned at episode {episode + 1}: Sharpe={val_metrics['sharpe']:.4f}"
+                    f"Pruned at episode {episode + 1}: objective={reported_sharpe:.4f}"
                 )
 
     final_val_metrics = drl_train._evaluate_on_validation(
@@ -192,9 +211,31 @@ def objective(trial: optuna.Trial) -> float:
         commission=0.002,
     )
     final_sharpe = float(final_val_metrics['sharpe'])
+    objective_value = final_sharpe
+    if final_val_metrics['trades'] == 0:
+        objective_value -= NO_TRADE_SHARPE_PENALTY
+
     trial.set_user_attr("final_val_return", float(final_val_metrics['return']))
     trial.set_user_attr("final_val_max_drawdown", float(final_val_metrics['max_drawdown']))
-    return final_sharpe
+    trial.set_user_attr("final_val_trades", int(final_val_metrics['trades']))
+    trial.set_user_attr("final_val_avg_positions", float(final_val_metrics['avg_positions']))
+    trial.set_user_attr("final_val_action_hold_pct", float(final_val_metrics['action_hold_pct']))
+    trial.set_user_attr("final_val_action_buy_pct", float(final_val_metrics['action_buy_pct']))
+    trial.set_user_attr("final_val_action_sell_pct", float(final_val_metrics['action_sell_pct']))
+    logger.info(
+        f"Trial {trial.number} final | "
+        f"Val Return={final_val_metrics['return']:.2f}% | "
+        f"Sharpe={final_sharpe:.4f} | "
+        f"Objective={objective_value:.4f} | "
+        f"MaxDD={final_val_metrics['max_drawdown']:.2f}% | "
+        f"Trades={final_val_metrics['trades']} | "
+        f"AvgPos={final_val_metrics['avg_positions']:.1f} | "
+        f"Actions H/B/S="
+        f"{final_val_metrics['action_hold_pct']:.1%}/"
+        f"{final_val_metrics['action_buy_pct']:.1%}/"
+        f"{final_val_metrics['action_sell_pct']:.1%}"
+    )
+    return objective_value
 
 
 if __name__ == "__main__":

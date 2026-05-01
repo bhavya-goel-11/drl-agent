@@ -88,7 +88,16 @@ def _evaluate_on_validation(
     commission: float = 0.002,
 ):
     if data_3d.shape[0] < 2:
-        return {'return': 0.0, 'sharpe': 0.0, 'max_drawdown': 0.0}
+        return {
+            'return': 0.0,
+            'sharpe': 0.0,
+            'max_drawdown': 0.0,
+            'trades': 0,
+            'avg_positions': 0.0,
+            'action_hold_pct': 0.0,
+            'action_buy_pct': 0.0,
+            'action_sell_pct': 0.0,
+        }
 
     close_idx = columns.index('close') if 'close' in columns else -1
     open_idx = columns.index('open') if 'open' in columns else close_idx
@@ -97,6 +106,9 @@ def _evaluate_on_validation(
     cash = initial_balance
     holdings = np.zeros(n_stocks, dtype=np.float64)
     portfolio_history = []
+    action_counts = np.zeros(3, dtype=np.int64)
+    position_counts = []
+    trades = 0
 
     was_training = trainer.policy_net.training
     trainer.policy_net.eval()
@@ -118,10 +130,12 @@ def _evaluate_on_validation(
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(trainer.device)
             q_vals = trainer.policy_net(state_tensor)  # (1, N, 3)
             actions = q_vals.squeeze(0).argmax(dim=1).cpu().numpy()
+            action_counts += np.bincount(actions, minlength=3)[:3]
 
             exec_prices = data_3d[step + 1, :, open_idx]
             buy_mask = (actions == 1) & (holdings == 0)
             sell_mask = (actions == 2) & (holdings > 0)
+            trades += int(buy_mask.sum() + sell_mask.sum())
 
             for i in np.where(sell_mask)[0]:
                 revenue = holdings[i] * exec_prices[i]
@@ -141,6 +155,7 @@ def _evaluate_on_validation(
                         cost = shares * exec_prices[i] * (1 + commission)
                         cash -= cost
                         holdings[i] = shares
+            position_counts.append(int(np.sum(holdings > 0)))
 
     final_close = data_3d[-1, :, close_idx]
     final_pv = float(cash + np.sum(holdings * final_close))
@@ -157,6 +172,12 @@ def _evaluate_on_validation(
     rolling_max = np.maximum.accumulate(eq)
     dd = (eq - rolling_max) / np.where(rolling_max == 0, 1.0, rolling_max)
     max_dd = dd.min() * 100
+    total_actions = int(action_counts.sum())
+    action_pct = (
+        action_counts / total_actions
+        if total_actions > 0
+        else np.zeros(3, dtype=np.float64)
+    )
 
     if was_training:
         trainer.policy_net.train()
@@ -165,6 +186,11 @@ def _evaluate_on_validation(
         'return': float(total_return),
         'sharpe': float(sharpe),
         'max_drawdown': float(max_dd),
+        'trades': int(trades),
+        'avg_positions': float(np.mean(position_counts)) if position_counts else 0.0,
+        'action_hold_pct': float(action_pct[0]),
+        'action_buy_pct': float(action_pct[1]),
+        'action_sell_pct': float(action_pct[2]),
     }
 
 

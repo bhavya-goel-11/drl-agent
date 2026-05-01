@@ -129,6 +129,7 @@ class MLBaselineTrader:
                 subsample=0.8, colsample_bytree=0.8, min_child_weight=5,
                 reg_alpha=0.1, reg_lambda=1.0, eval_metric='mlogloss',
                 random_state=42, n_jobs=-1, verbosity=0,
+                tree_method='hist', device='cuda',
             )
         else:
             logger.info("Training Sklearn Gradient Boosting...")

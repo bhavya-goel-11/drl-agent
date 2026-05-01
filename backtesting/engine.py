@@ -158,9 +158,10 @@ class BacktestEngine:
             # Inference
             state = self._build_state(step)
             with torch.no_grad():
-                q_vals = self.model(
-                    torch.FloatTensor(state).unsqueeze(0))  # (1, N, 3)
-                actions = q_vals.squeeze(0).argmax(dim=1).numpy()  # (N,)
+                device = next(self.model.parameters()).device
+                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+                q_vals = self.model(state_tensor)  # (1, N, 3)
+                actions = q_vals.squeeze(0).argmax(dim=1).cpu().numpy()  # (N,)
 
             # Execution at next-day open
             next_step = step + 1

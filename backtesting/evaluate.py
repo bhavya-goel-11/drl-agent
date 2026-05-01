@@ -129,12 +129,15 @@ def main():
     cutoff = pd.to_datetime(TRAIN_CUTOFF)
     train_end_idx = int(np.searchsorted(dates, cutoff))
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device} for D3QN inference")
+
     # 1. D3QN Backtest
     obs_dim = n_stocks * n_features + n_stocks + 3
-    agent = DRLAgent(state_dim=obs_dim, action_dim=3, n_stocks=n_stocks)
+    agent = DRLAgent(state_dim=obs_dim, action_dim=3, n_stocks=n_stocks).to(device)
     
     try:
-        checkpoint = torch.load("drl_models/best_universal_dqn_trader.pth", map_location='cpu')
+        checkpoint = torch.load("drl_models/best_universal_dqn_trader.pth", map_location=device)
         agent.load_state_dict(checkpoint['policy_net'] if 'policy_net' in checkpoint else checkpoint)
         agent.eval()
     except Exception as e:
