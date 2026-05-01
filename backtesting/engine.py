@@ -5,7 +5,7 @@ import torch
 import matplotlib.pyplot as plt
 import seaborn as sns
 from loguru import logger
-from drl_models.agent import mask_invalid_q_values
+from drl_models.agent import enforce_minimum_positions, mask_invalid_q_values
 
 
 class BacktestEngine:
@@ -163,7 +163,14 @@ class BacktestEngine:
                 state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
                 q_vals = self.model(state_tensor)  # (1, N, 3)
                 q_vals = mask_invalid_q_values(q_vals, state_tensor, self.n_stocks)
-                actions = q_vals.squeeze(0).argmax(dim=1).cpu().numpy()  # (N,)
+                q_np = q_vals.squeeze(0).cpu().numpy()
+                actions = enforce_minimum_positions(
+                    actions=q_np.argmax(axis=1),
+                    q_values=q_np,
+                    state=state,
+                    n_stocks=self.n_stocks,
+                    min_positions=max(1, self.n_stocks // 10),
+                )
 
             # Execution at next-day open
             next_step = step + 1

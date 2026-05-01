@@ -39,6 +39,35 @@ def _position_values_from_state(state: np.ndarray, n_stocks: int) -> np.ndarray:
     return state[position_start:position_end]
 
 
+def enforce_minimum_positions(
+    actions: np.ndarray,
+    q_values: np.ndarray,
+    state: np.ndarray,
+    n_stocks: int,
+    min_positions: int,
+) -> np.ndarray:
+    """Ensure the long-only policy keeps at least a small portfolio deployed."""
+    if min_positions <= 0:
+        return actions
+
+    adjusted = np.asarray(actions, dtype=np.int64).copy()
+    position_vals = _position_values_from_state(state, n_stocks)
+    has_position = position_vals > 1e-8
+    projected_positions = int(has_position.sum() + np.sum((adjusted == 1) & (~has_position)))
+    deficit = min_positions - projected_positions
+    if deficit <= 0:
+        return adjusted
+
+    flat_candidates = np.where((~has_position) & (adjusted != 1))[0]
+    if len(flat_candidates) == 0:
+        return adjusted
+
+    buy_scores = q_values[flat_candidates, 1] - q_values[flat_candidates, 0]
+    ranked = flat_candidates[np.argsort(buy_scores)[::-1]]
+    adjusted[ranked[:deficit]] = 1
+    return adjusted
+
+
 # ---------------------------------------------------------------------------
 # NoisyLinear Layer (Factorised Gaussian Noise)
 # Replaces epsilon-greedy with learned, state-dependent exploration.
@@ -388,7 +417,8 @@ class DQNTrainer:
     def __init__(self, state_dim: int, action_dim: int, n_stocks: int,
                  lr: float = 1e-4, gamma: float = 0.99, tau: float = 0.005,
                  epsilon_start: float = 0.35, epsilon_end: float = 0.05,
-                 epsilon_decay_steps: int = 100_000):
+                 epsilon_decay_steps: int = 100_000,
+                 min_positions: int = None):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.gamma = gamma
         self.tau = tau
@@ -398,6 +428,9 @@ class DQNTrainer:
         self.epsilon_end = epsilon_end
         self.epsilon_decay_steps = max(1, epsilon_decay_steps)
         self.action_steps = 0
+        self.min_positions = (
+            max(1, self.n_stocks // 10) if min_positions is None else min_positions
+        )
         
         # Policy network (actively trains)
         self.policy_net = DRLAgent(state_dim, action_dim, n_stocks).to(self.device)
@@ -432,7 +465,13 @@ class DQNTrainer:
             actions[flat_idx] = np.random.choice([0, 1], size=len(flat_idx))
         if len(held_idx) > 0:
             actions[held_idx] = np.random.choice([0, 2], size=len(held_idx))
-        return actions
+        return enforce_minimum_positions(
+            actions=actions,
+            q_values=np.zeros((self.n_stocks, self.action_dim), dtype=np.float32),
+            state=state,
+            n_stocks=self.n_stocks,
+            min_positions=self.min_positions,
+        )
 
     def train_step(self, states, actions, rewards, next_states, dones,
                    is_weights=None):
@@ -530,8 +569,15 @@ class DQNTrainer:
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             q_values = self.policy_net(state_tensor)      # (1, N, 3)
             q_values = mask_invalid_q_values(q_values, state_tensor, self.n_stocks)
-            actions = q_values.squeeze(0).argmax(dim=1)   # (N,)
-            return actions.cpu().numpy()
+            q_np = q_values.squeeze(0).cpu().numpy()
+            actions = q_np.argmax(axis=1)
+            return enforce_minimum_positions(
+                actions=actions,
+                q_values=q_np,
+                state=state,
+                n_stocks=self.n_stocks,
+                min_positions=self.min_positions,
+            )
 
     def save_checkpoint(self, filepath: str):
         torch.save({
