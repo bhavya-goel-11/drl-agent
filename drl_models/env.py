@@ -37,8 +37,8 @@ class VectorizedTradingEnv(gym.Env):
         drawdown_penalty_coeff: float = 0.1,
         turnover_penalty_coeff: float = 0.01,
         invalid_action_penalty: float = 0.001,
-        flat_position_penalty: float = 0.0001,
-        missed_upside_penalty_coeff: float = 0.05,
+        flat_position_penalty: float = 0.0005,
+        missed_upside_penalty_coeff: float = 0.2,
     ):
         """
         Args:

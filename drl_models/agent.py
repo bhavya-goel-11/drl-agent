@@ -32,6 +32,13 @@ def mask_invalid_q_values(
     return masked
 
 
+def _position_values_from_state(state: np.ndarray, n_stocks: int) -> np.ndarray:
+    market_dim = state.shape[0] - n_stocks - 3
+    position_start = market_dim
+    position_end = position_start + n_stocks
+    return state[position_start:position_end]
+
+
 # ---------------------------------------------------------------------------
 # NoisyLinear Layer (Factorised Gaussian Noise)
 # Replaces epsilon-greedy with learned, state-dependent exploration.
@@ -379,12 +386,18 @@ class ReplayBuffer:
 # ---------------------------------------------------------------------------
 class DQNTrainer:
     def __init__(self, state_dim: int, action_dim: int, n_stocks: int,
-                 lr: float = 1e-4, gamma: float = 0.99, tau: float = 0.005):
+                 lr: float = 1e-4, gamma: float = 0.99, tau: float = 0.005,
+                 epsilon_start: float = 0.35, epsilon_end: float = 0.05,
+                 epsilon_decay_steps: int = 100_000):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.gamma = gamma
         self.tau = tau
         self.action_dim = action_dim
         self.n_stocks = n_stocks
+        self.epsilon_start = epsilon_start
+        self.epsilon_end = epsilon_end
+        self.epsilon_decay_steps = max(1, epsilon_decay_steps)
+        self.action_steps = 0
         
         # Policy network (actively trains)
         self.policy_net = DRLAgent(state_dim, action_dim, n_stocks).to(self.device)
@@ -402,6 +415,24 @@ class DQNTrainer:
         
         logger.info(f"Initialized Vectorised D3QN Trainer on {self.device} | "
                      f"State: {state_dim} | Actions: {action_dim}×{n_stocks} | τ: {tau}")
+
+    def _current_epsilon(self) -> float:
+        progress = min(1.0, self.action_steps / self.epsilon_decay_steps)
+        return self.epsilon_start + progress * (self.epsilon_end - self.epsilon_start)
+
+    def _sample_valid_random_actions(self, state: np.ndarray) -> np.ndarray:
+        position_vals = _position_values_from_state(state, self.n_stocks)
+        has_position = position_vals > 1e-8
+        actions = np.zeros(self.n_stocks, dtype=np.int64)
+
+        flat_idx = np.where(~has_position)[0]
+        held_idx = np.where(has_position)[0]
+
+        if len(flat_idx) > 0:
+            actions[flat_idx] = np.random.choice([0, 1], size=len(flat_idx))
+        if len(held_idx) > 0:
+            actions[held_idx] = np.random.choice([0, 2], size=len(held_idx))
+        return actions
 
     def train_step(self, states, actions, rewards, next_states, dones,
                    is_weights=None):
@@ -492,6 +523,9 @@ class DQNTrainer:
         """
         with torch.no_grad():
             if self.policy_net.training:
+                self.action_steps += 1
+                if np.random.random() < self._current_epsilon():
+                    return self._sample_valid_random_actions(state)
                 self.policy_net.reset_noise()
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             q_values = self.policy_net(state_tensor)      # (1, N, 3)
