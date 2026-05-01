@@ -140,6 +140,7 @@ def objective(trial: optuna.Trial) -> float:
 
     episodes = 1500
     warmup_episodes = 50
+    no_trade_eval_count = 0
 
     for episode in range(episodes):
         drl_train._cosine_annealing_lr(
@@ -181,6 +182,9 @@ def objective(trial: optuna.Trial) -> float:
             reported_sharpe = float(val_metrics['sharpe'])
             if val_metrics['trades'] == 0:
                 reported_sharpe -= NO_TRADE_SHARPE_PENALTY
+                no_trade_eval_count += 1
+            else:
+                no_trade_eval_count = 0
 
             logger.info(
                 f"Trial {trial.number} Ep {episode + 1}/{episodes} | "
@@ -197,6 +201,11 @@ def objective(trial: optuna.Trial) -> float:
             )
 
             trial.report(reported_sharpe, episode + 1)
+            if no_trade_eval_count >= 2:
+                raise optuna.TrialPruned(
+                    f"Pruned after {no_trade_eval_count} consecutive no-trade "
+                    f"validation checks at episode {episode + 1}."
+                )
             if trial.should_prune():
                 raise optuna.TrialPruned(
                     f"Pruned at episode {episode + 1}: objective={reported_sharpe:.4f}"

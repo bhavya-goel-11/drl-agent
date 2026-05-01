@@ -37,6 +37,8 @@ class VectorizedTradingEnv(gym.Env):
         drawdown_penalty_coeff: float = 0.1,
         turnover_penalty_coeff: float = 0.01,
         invalid_action_penalty: float = 0.001,
+        flat_position_penalty: float = 0.0001,
+        missed_upside_penalty_coeff: float = 0.05,
     ):
         """
         Args:
@@ -52,6 +54,8 @@ class VectorizedTradingEnv(gym.Env):
             drawdown_penalty_coeff:  Weight of the drawdown penalty term.
             turnover_penalty_coeff:  Weight of the turnover penalty term.
             invalid_action_penalty:  Per-head penalty for impossible actions.
+            flat_position_penalty:  Cost for staying out of a stock.
+            missed_upside_penalty_coeff:  Cost for missing positive moves while flat.
         """
         super().__init__()
 
@@ -78,6 +82,8 @@ class VectorizedTradingEnv(gym.Env):
         self.drawdown_penalty_coeff = drawdown_penalty_coeff
         self.turnover_penalty_coeff = turnover_penalty_coeff
         self.invalid_action_penalty = invalid_action_penalty
+        self.flat_position_penalty = flat_position_penalty
+        self.missed_upside_penalty_coeff = missed_upside_penalty_coeff
 
         # --- Spaces ---
         # Action: one discrete action per stock  (0=Hold, 1=Buy, 2=Sell)
@@ -342,9 +348,10 @@ class VectorizedTradingEnv(gym.Env):
         drawdown_penalty = self.drawdown_penalty_coeff * drawdown
 
         # Equal-weight index return uses cross-sectional close-to-close move
-        equal_weight_index_return = float(np.mean(
+        market_returns = (
             (curr_close_prices - prev_close_prices) / (prev_close_prices + 1e-12)
-        ))
+        )
+        equal_weight_index_return = float(np.mean(market_returns))
 
         # Rolling downside volatility penalty over active-step return history
         active_step_return = float(stock_returns[is_active].mean()) if np.any(is_active) else 0.0
@@ -372,7 +379,12 @@ class VectorizedTradingEnv(gym.Env):
             base = stock_returns - transaction_cost - drawdown_penalty
 
         rewards[is_active] = base[is_active].astype(np.float32)
-        rewards[~is_active] = 0.0
+        flat_inactive = ~is_active
+        missed_upside = np.maximum(market_returns, 0.0)
+        rewards[flat_inactive] = (
+            -self.flat_position_penalty
+            - self.missed_upside_penalty_coeff * missed_upside[flat_inactive]
+        ).astype(np.float32)
         return rewards
 
     # ------------------------------------------------------------------
