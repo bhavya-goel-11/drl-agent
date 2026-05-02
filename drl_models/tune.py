@@ -102,10 +102,10 @@ def _warm_start_policy(
     sample_steps: int = 256,
     epochs: int = 3,
     batch_size: int = 64,
-) -> None:
+) -> tuple:
     """Give the policy a small supervised prior before RL fine-tuning."""
     if train_data_3d.shape[0] <= horizon + 1:
-        return
+        return None, None
 
     close_idx = columns.index('close') if 'close' in columns else -1
     max_step = train_data_3d.shape[0] - horizon - 1
@@ -179,6 +179,7 @@ def _warm_start_policy(
         f"Warm-started policy on {states_t.shape[0]} supervised states "
         f"(horizon={horizon}, buy>{buy_threshold:.1%}, sell<{sell_threshold:.1%})"
     )
+    return states_t.detach(), labels_t.detach()
 
 
 def objective(trial: optuna.Trial) -> float:
@@ -227,7 +228,7 @@ def objective(trial: optuna.Trial) -> float:
         gamma=gamma,
         tau=tau,
     )
-    _warm_start_policy(
+    demo_states, demo_labels = _warm_start_policy(
         trainer=trainer,
         train_data_3d=train_data_3d,
         columns=columns,
@@ -237,7 +238,14 @@ def objective(trial: optuna.Trial) -> float:
 
     episodes = 1500
     warmup_episodes = 50
+    val_eval_interval = 50
     no_trade_eval_count = 0
+    best_objective = -float('inf')
+    best_episode = 0
+    best_val_metrics = None
+    train_updates = 0
+    bc_interval = 4
+    bc_weight = 0.2
 
     for episode in range(episodes):
         drl_train._cosine_annealing_lr(
@@ -264,10 +272,28 @@ def objective(trial: optuna.Trial) -> float:
                     s, a, r, ns, d, idxs, is_w = sample
                     _, td_errors = trainer.train_step(s, a, r, ns, d, is_w)
                     buffer.update_priorities(idxs, td_errors)
+                    train_updates += 1
+
+                    if (
+                        demo_states is not None
+                        and train_updates % bc_interval == 0
+                    ):
+                        demo_batch_size = min(batch_size, demo_states.shape[0])
+                        demo_idx = torch.randint(
+                            low=0,
+                            high=demo_states.shape[0],
+                            size=(demo_batch_size,),
+                            device=trainer.device,
+                        )
+                        trainer.behavior_clone_step(
+                            demo_states[demo_idx],
+                            demo_labels[demo_idx],
+                            bc_weight=bc_weight,
+                        )
 
             trainer.soft_sync_target_network()
 
-        if (episode + 1) % 100 == 0:
+        if (episode + 1) % val_eval_interval == 0:
             val_metrics = drl_train._evaluate_on_validation(
                 trainer=trainer,
                 data_3d=val_data_3d,
@@ -282,6 +308,10 @@ def objective(trial: optuna.Trial) -> float:
                 no_trade_eval_count += 1
             else:
                 no_trade_eval_count = 0
+                if reported_sharpe > best_objective:
+                    best_objective = reported_sharpe
+                    best_episode = episode + 1
+                    best_val_metrics = dict(val_metrics)
 
             logger.info(
                 f"Trial {trial.number} Ep {episode + 1}/{episodes} | "
@@ -298,6 +328,13 @@ def objective(trial: optuna.Trial) -> float:
             )
 
             trial.report(reported_sharpe, episode + 1)
+            if no_trade_eval_count >= 1 and best_val_metrics is not None:
+                logger.info(
+                    f"Trial {trial.number} stopping after first post-trade "
+                    f"collapse; returning best checkpoint from episode "
+                    f"{best_episode} with objective={best_objective:.4f}"
+                )
+                break
             if no_trade_eval_count >= 2:
                 raise optuna.TrialPruned(
                     f"Pruned after {no_trade_eval_count} consecutive no-trade "
@@ -321,6 +358,16 @@ def objective(trial: optuna.Trial) -> float:
     if final_val_metrics['trades'] == 0:
         objective_value -= NO_TRADE_SHARPE_PENALTY
 
+    if final_val_metrics['trades'] > 0 and objective_value > best_objective:
+        best_objective = objective_value
+        best_episode = episodes
+        best_val_metrics = dict(final_val_metrics)
+
+    if best_val_metrics is not None:
+        objective_value = best_objective
+    else:
+        best_episode = 0
+
     trial.set_user_attr("final_val_return", float(final_val_metrics['return']))
     trial.set_user_attr("final_val_max_drawdown", float(final_val_metrics['max_drawdown']))
     trial.set_user_attr("final_val_trades", int(final_val_metrics['trades']))
@@ -328,6 +375,14 @@ def objective(trial: optuna.Trial) -> float:
     trial.set_user_attr("final_val_action_hold_pct", float(final_val_metrics['action_hold_pct']))
     trial.set_user_attr("final_val_action_buy_pct", float(final_val_metrics['action_buy_pct']))
     trial.set_user_attr("final_val_action_sell_pct", float(final_val_metrics['action_sell_pct']))
+    trial.set_user_attr("best_val_episode", int(best_episode))
+    trial.set_user_attr("best_val_objective", float(objective_value))
+    if best_val_metrics is not None:
+        trial.set_user_attr("best_val_return", float(best_val_metrics['return']))
+        trial.set_user_attr("best_val_sharpe", float(best_val_metrics['sharpe']))
+        trial.set_user_attr("best_val_max_drawdown", float(best_val_metrics['max_drawdown']))
+        trial.set_user_attr("best_val_trades", int(best_val_metrics['trades']))
+        trial.set_user_attr("best_val_avg_positions", float(best_val_metrics['avg_positions']))
     logger.info(
         f"Trial {trial.number} final | "
         f"Val Return={final_val_metrics['return']:.2f}% | "
@@ -341,6 +396,17 @@ def objective(trial: optuna.Trial) -> float:
         f"{final_val_metrics['action_buy_pct']:.1%}/"
         f"{final_val_metrics['action_sell_pct']:.1%}"
     )
+    if best_val_metrics is not None:
+        logger.info(
+            f"Trial {trial.number} best | "
+            f"Ep={best_episode} | "
+            f"Return={best_val_metrics['return']:.2f}% | "
+            f"Sharpe={best_val_metrics['sharpe']:.4f} | "
+            f"Objective={objective_value:.4f} | "
+            f"MaxDD={best_val_metrics['max_drawdown']:.2f}% | "
+            f"Trades={best_val_metrics['trades']} | "
+            f"AvgPos={best_val_metrics['avg_positions']:.1f}"
+        )
     return objective_value
 
 

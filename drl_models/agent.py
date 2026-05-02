@@ -530,6 +530,34 @@ class DQNTrainer:
         mean_td = td_errors.detach().abs().cpu().numpy().mean(axis=1)  # (B,)
         return loss.item(), mean_td
 
+    def behavior_clone_step(self, states, labels, bc_weight: float = 0.2):
+        """
+        Supervised anchor update that keeps the policy from forgetting the
+        warm-start Buy/Sell prior during off-policy DQN training.
+        """
+        if not torch.is_tensor(states):
+            states = torch.FloatTensor(states).to(self.device)
+        else:
+            states = states.to(self.device)
+
+        if not torch.is_tensor(labels):
+            labels = torch.LongTensor(labels).to(self.device)
+        else:
+            labels = labels.to(self.device)
+
+        logits = self.policy_net(states)
+        loss = F.cross_entropy(
+            logits.reshape(-1, self.action_dim),
+            labels.reshape(-1),
+        ) * bc_weight
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=10.0)
+        self.optimizer.step()
+        self.policy_net.reset_noise()
+        return loss.item()
+
     def soft_sync_target_network(self):
         """
         Polyak averaging: θ_target = τ * θ_policy + (1 - τ) * θ_target
