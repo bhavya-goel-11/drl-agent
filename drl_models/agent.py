@@ -418,7 +418,7 @@ class DQNTrainer:
                  lr: float = 1e-4, gamma: float = 0.99, tau: float = 0.005,
                  epsilon_start: float = 0.35, epsilon_end: float = 0.05,
                  epsilon_decay_steps: int = 100_000,
-                 min_positions: int = None):
+                 min_positions: int = 0):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.gamma = gamma
         self.tau = tau
@@ -428,9 +428,7 @@ class DQNTrainer:
         self.epsilon_end = epsilon_end
         self.epsilon_decay_steps = max(1, epsilon_decay_steps)
         self.action_steps = 0
-        self.min_positions = (
-            max(1, self.n_stocks // 10) if min_positions is None else min_positions
-        )
+        self.min_positions = min_positions
         
         # Policy network (actively trains)
         self.policy_net = DRLAgent(state_dim, action_dim, n_stocks).to(self.device)

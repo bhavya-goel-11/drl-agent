@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import numpy as np
 import optuna
 import pandas as pd
+import torch
 
 from loguru import logger
 
@@ -90,6 +91,96 @@ def _get_data():
     return _DATA_CACHE
 
 
+def _warm_start_policy(
+    trainer: DQNTrainer,
+    train_data_3d: np.ndarray,
+    columns: list,
+    initial_balance: float = 10_000_000.0,
+    horizon: int = 20,
+    buy_threshold: float = 0.03,
+    sell_threshold: float = -0.03,
+    sample_steps: int = 256,
+    epochs: int = 3,
+    batch_size: int = 64,
+) -> None:
+    """Give the policy a small supervised prior before RL fine-tuning."""
+    if train_data_3d.shape[0] <= horizon + 1:
+        return
+
+    close_idx = columns.index('close') if 'close' in columns else -1
+    max_step = train_data_3d.shape[0] - horizon - 1
+    sample_count = min(sample_steps, max_step)
+    steps = np.linspace(0, max_step - 1, num=sample_count, dtype=np.int64)
+
+    states = []
+    labels = []
+    n_stocks = train_data_3d.shape[1]
+
+    for step in steps:
+        close_now = train_data_3d[step, :, close_idx]
+        close_future = train_data_3d[step + horizon, :, close_idx]
+        future_ret = (close_future - close_now) / (close_now + 1e-12)
+
+        flat_holdings = np.zeros(n_stocks, dtype=np.float64)
+        flat_labels = np.zeros(n_stocks, dtype=np.int64)
+        flat_labels[future_ret > buy_threshold] = 1
+        states.append(drl_train._build_validation_state(
+            data_3d=train_data_3d,
+            current_step=int(step),
+            holdings=flat_holdings,
+            cash=initial_balance,
+            initial_balance=initial_balance,
+            close_idx=close_idx,
+        ))
+        labels.append(flat_labels)
+
+        held_prices = np.maximum(close_now, 1e-12)
+        held_holdings = (initial_balance / n_stocks) / held_prices
+        held_labels = np.zeros(n_stocks, dtype=np.int64)
+        held_labels[future_ret < sell_threshold] = 2
+        states.append(drl_train._build_validation_state(
+            data_3d=train_data_3d,
+            current_step=int(step),
+            holdings=held_holdings,
+            cash=0.0,
+            initial_balance=initial_balance,
+            close_idx=close_idx,
+        ))
+        labels.append(held_labels)
+
+    states_t = torch.FloatTensor(np.array(states, dtype=np.float32)).to(trainer.device)
+    labels_t = torch.LongTensor(np.array(labels, dtype=np.int64)).to(trainer.device)
+
+    was_training = trainer.policy_net.training
+    trainer.policy_net.train()
+    criterion = torch.nn.CrossEntropyLoss()
+
+    order = torch.arange(states_t.shape[0], device=trainer.device)
+    for _ in range(epochs):
+        order = order[torch.randperm(order.numel(), device=trainer.device)]
+        for start in range(0, order.numel(), batch_size):
+            idx = order[start:start + batch_size]
+            logits = trainer.policy_net(states_t[idx])
+            loss = criterion(
+                logits.reshape(-1, trainer.action_dim),
+                labels_t[idx].reshape(-1),
+            )
+            trainer.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainer.policy_net.parameters(), max_norm=10.0)
+            trainer.optimizer.step()
+            trainer.policy_net.reset_noise()
+
+    trainer.sync_target_network()
+    if not was_training:
+        trainer.policy_net.eval()
+
+    logger.info(
+        f"Warm-started policy on {states_t.shape[0]} supervised states "
+        f"(horizon={horizon}, buy>{buy_threshold:.1%}, sell<{sell_threshold:.1%})"
+    )
+
+
 def objective(trial: optuna.Trial) -> float:
     window_size = trial.suggest_categorical("window_size", [126, 252, 504])
     lr = trial.suggest_float("lr", 1e-4, 5e-4, log=True)
@@ -135,6 +226,12 @@ def objective(trial: optuna.Trial) -> float:
         lr=lr,
         gamma=gamma,
         tau=tau,
+    )
+    _warm_start_policy(
+        trainer=trainer,
+        train_data_3d=train_data_3d,
+        columns=columns,
+        initial_balance=10_000_000.0,
     )
     buffer = PrioritizedReplayBuffer(capacity=buffer_capacity)
 
